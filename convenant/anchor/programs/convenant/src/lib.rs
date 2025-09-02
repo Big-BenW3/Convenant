@@ -190,6 +190,135 @@ pub mod convenant {
 
         Ok(())
     }
+
+    // -----------------------------------------------------------------
+    // Private delegation (base layer, PER)
+    // -----------------------------------------------------------------
+
+    /// Delegates the covenant PDA to the ER so the parties can negotiate
+    /// privately. Delegate-only (no bundled base-layer permission CPI): the
+    /// private access-control account is created *on the ER* afterwards via
+    /// `init_permission`, which is the canonical PER flow — it avoids the
+    /// base-layer ACL round-trip and the extra base-layer account for the
+    /// permission. Users of the convenience `delegate_covenant` never pay for
+    /// the permission account on L1.
+    pub fn delegate_covenant(ctx: Context<DelegateCovenant>) -> Result<()> {
+        let data = ctx.accounts.covenant.try_borrow_data()?;
+        require!(
+            &data[..8] == &Covenant::DISCRIMINATOR[..],
+            ConvenantError::CovenantPdaMismatch
+        );
+        let mut covenant = Covenant::deserialize(&mut &data[8..])?;
+        drop(data);
+
+        // The delegate field is an `UncheckedAccount` (canonical PER pattern), so
+        // re-assert the PDA seeds manually and derive the exact seed set for the
+        // SDK delegation.
+        let actual_key = ctx.accounts.covenant.key();
+        let (derived_key, _) = Pubkey::find_program_address(
+            &[
+                COVENANT_SEED,
+                covenant.creator.as_ref(),
+                covenant.nonce.to_le_bytes().as_ref(),
+            ],
+            &crate::ID,
+        );
+        require!(actual_key == derived_key, ConvenantError::CovenantPdaMismatch);
+
+        require!(
+            covenant.counterparty_joined,
+            ConvenantError::CounterpartyNotJoined
+        );
+
+        // Delegate the covenant PDA itself to the (optionally TEE-pinned) ER.
+        // The status is serialized into the covenant *before* the delegation
+        // dance: the SDK zeroes the PDA, assigns it to the delegation program,
+        // and the delegation program restores the data from the buffer it took
+        // before zeroing — so the account carries `ActiveOnEr` onto the ER. Any
+        // write after delegation would violate the non-owner data rule.
+        if ctx.accounts.covenant.owner != &ephemeral_rollups_sdk::id() {
+            covenant.status = CovenantStatus::ActiveOnEr;
+            let mut data = ctx.accounts.covenant.try_borrow_mut_data()?;
+            covenant.serialize(&mut &mut data[8..])?;
+            drop(data);
+
+            ctx.accounts.delegate_covenant(
+                &ctx.accounts.payer,
+                &[
+                    COVENANT_SEED,
+                    covenant.creator.as_ref(),
+                    covenant.nonce.to_le_bytes().as_ref(),
+                ],
+                DelegateConfig {
+                    validator: ctx.accounts.validator.as_ref().map(|v| v.key()),
+                    ..Default::default()
+                },
+            )?;
+        }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Private access control (ephemeral rollup, TEE-enforced)
+    // -----------------------------------------------------------------
+
+    /// Creates the private permission account for the covenant directly on the
+    /// ER. Runs on the ER after `delegate_covenant`; `payer` = the (delegated)
+    /// covenant PDA, which signs with its base seeds and spends its mirrored
+    /// lamports as the rent sponsor. Idempotent: skips if it already exists.
+    /// Both creator and counterparty are granted full authority (PER) so each
+    /// can read the other's committed offer through the TEE, while anyone else
+    /// is rejected.
+    pub fn init_permission(ctx: Context<PermissionContext>) -> Result<()> {
+        let covenant = &ctx.accounts.covenant;
+
+        require!(
+            covenant.status == CovenantStatus::ActiveOnEr,
+            ConvenantError::InvalidStatus
+        );
+        require!(
+            covenant.is_party(&ctx.accounts.payer.key()),
+            ConvenantError::UnauthorizedSigner
+        );
+
+        if ctx.accounts.permission.lamports() > 0 {
+            msg!("Permission already exists, skipping creation");
+            return Ok(());
+        }
+
+        let nonce_bytes = covenant.nonce.to_le_bytes();
+        let signers = [
+            COVENANT_SEED,
+            covenant.creator.as_ref(),
+            nonce_bytes.as_ref(),
+            &[covenant.bump],
+        ];
+        CreateEphemeralPermissionCpi {
+            payer: ctx.accounts.covenant.to_account_info(),
+            permissioned_account: ctx.accounts.covenant.to_account_info(),
+            permission: ctx.accounts.permission.to_account_info(),
+            vault: ctx.accounts.ephemeral_vault.to_account_info(),
+            magic_program: ctx.accounts.magic_program.to_account_info(),
+            permission_program: ctx.accounts.permission_program.to_account_info(),
+            args: EphemeralMembersArgs {
+                is_private: true,
+                members: vec![
+                    Member {
+                        flags: AUTHORITY,
+                        pubkey: covenant.creator,
+                    },
+                    Member {
+                        flags: AUTHORITY,
+                        pubkey: covenant.counterparty.expect("joined before permission"),
+                    },
+                ],
+            },
+        }
+        .invoke_signed(&[&signers])?;
+
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -248,4 +377,49 @@ pub struct JoinCovenant<'info> {
     #[account()]
     pub token_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
+}
+
+#[delegate]
+#[derive(Accounts)]
+pub struct DelegateCovenant<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK: The covenant PDA to delegate (private terms live here on the ER).
+    /// `UncheckedAccount` + `del` — canonical PER pattern; the PDA seeds are
+    /// re-asserted in the handler before the SDK delegation runs.
+    #[account(mut, del)]
+    pub covenant: UncheckedAccount<'info>,
+    /// CHECK: Checked by the delegation program (TEE validator to pin the ER).
+    pub validator: Option<UncheckedAccount<'info>>,
+}
+
+/// Shared context for `init_permission` — runs on the ER, operates on the
+/// ephemeral permission account for the covenant.
+#[derive(Accounts)]
+pub struct PermissionContext<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [COVENANT_SEED, covenant.creator.as_ref(), covenant.nonce.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub covenant: Account<'info, Covenant>,
+    /// CHECK: verified by the permission program; seeds match the on-chain layout
+    #[account(
+        mut,
+        seeds = [PERMISSION_SEED, covenant.key().as_ref()],
+        bump,
+        seeds::program = PERMISSION_PROGRAM_ID
+    )]
+    pub permission: UncheckedAccount<'info>,
+    /// CHECK: Permission Program
+    #[account(address = PERMISSION_PROGRAM_ID)]
+    pub permission_program: UncheckedAccount<'info>,
+    /// CHECK: verified by magic program
+    #[account(mut, address = EPHEMERAL_VAULT_ID)]
+    pub ephemeral_vault: UncheckedAccount<'info>,
+    /// CHECK: Magic Program
+    #[account(address = MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
 }
