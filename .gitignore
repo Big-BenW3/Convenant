@@ -1,0 +1,39 @@
+# Solana keypairs / program upgrade authorities — NEVER commit these.
+# The program keypair at convenant/anchor/target/deploy/ controls the deployed
+# contract; leaking it lets anyone upgrade it.
+*-keypair.json
+*-upgrade-buffer.json
+keypair.json
+*.keypair
+*.pem
+
+# Build artifacts (convenant/.gitignore also covers the inner tree)
+node_modules/
+.next/
+out/
+build/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
+
+# Anchor
+convenant/anchor/.anchor/
+convenant/anchor/target/
+test-ledger/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Vercel
+.vercel
+
+# Misc
+.DS_Store
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.idea/
+.vscode/
