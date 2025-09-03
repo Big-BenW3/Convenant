@@ -395,6 +395,56 @@ pub mod convenant {
 
         Ok(())
     }
+
+    // -----------------------------------------------------------------
+    // Private negotiation (ephemeral rollup)
+    // -----------------------------------------------------------------
+
+    /// A party updates their committed SOL offer during negotiation.
+    pub fn update_offer(ctx: Context<Negotiate>, new_amount: u64) -> Result<()> {
+        let covenant = &mut ctx.accounts.covenant;
+        require!(
+            covenant.status == CovenantStatus::ActiveOnEr,
+            ConvenantError::InvalidStatus
+        );
+
+        if ctx.accounts.payer.key() == covenant.creator {
+            require!(!covenant.creator_accepted, ConvenantError::FrozenAfterAccept);
+            covenant.creator_amount = new_amount;
+        } else if Some(ctx.accounts.payer.key()) == covenant.counterparty {
+            require!(!covenant.counterparty_accepted, ConvenantError::FrozenAfterAccept);
+            covenant.counterparty_amount = new_amount;
+        } else {
+            return err!(ConvenantError::UnauthorizedSigner);
+        }
+        require!(new_amount > 0, ConvenantError::ZeroAmount);
+
+        // Reset acceptance flags when terms change.
+        covenant.creator_accepted = false;
+        covenant.counterparty_accepted = false;
+        covenant.terms_hash = covenant.hash_terms();
+
+        Ok(())
+    }
+
+    /// A party accepts the current terms. Both must accept to settle.
+    pub fn accept(ctx: Context<Negotiate>) -> Result<()> {
+        let covenant = &mut ctx.accounts.covenant;
+        require!(
+            covenant.status == CovenantStatus::ActiveOnEr,
+            ConvenantError::InvalidStatus
+        );
+
+        if ctx.accounts.payer.key() == covenant.creator {
+            covenant.creator_accepted = true;
+        } else if Some(ctx.accounts.payer.key()) == covenant.counterparty {
+            covenant.counterparty_accepted = true;
+        } else {
+            return err!(ConvenantError::UnauthorizedSigner);
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -498,6 +548,18 @@ pub struct PermissionContext<'info> {
     /// CHECK: Magic Program
     #[account(address = MAGIC_PROGRAM_ID)]
     pub magic_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Negotiate<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [COVENANT_SEED, covenant.creator.as_ref(), covenant.nonce.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub covenant: Account<'info, Covenant>,
 }
 
 #[derive(Accounts)]
