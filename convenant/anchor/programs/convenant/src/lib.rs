@@ -319,6 +319,82 @@ pub mod convenant {
 
         Ok(())
     }
+
+    // -----------------------------------------------------------------
+    // Cancel / close (base layer)
+    // -----------------------------------------------------------------
+
+    /// The creator cancels a still-open covenant (never delegated), refunding
+    /// every locked party. Terminal: hits `Reverted`.
+    pub fn cancel_covenant(ctx: Context<CancelCovenant>) -> Result<()> {
+        let covenant = &ctx.accounts.covenant;
+
+        require!(
+            ctx.accounts.signer.key() == covenant.creator,
+            ConvenantError::UnauthorizedSigner
+        );
+        require!(
+            covenant.status == CovenantStatus::CreatedOnL1,
+            ConvenantError::InvalidStatus
+        );
+
+        let covenant_key = covenant.key();
+
+        release_asset(
+            &covenant_key,
+            &covenant.creator_asset,
+            &covenant.creator_mint,
+            covenant.creator_amount,
+            &ctx.accounts.vault.to_account_info(),
+            &ctx.accounts.creator,
+            &ctx.accounts.creator_vault_ata,
+            &ctx.accounts.creator_payout_ata,
+            &ctx.accounts.creator_mint_acct,
+            &ctx.accounts.token_program.to_account_info(),
+            covenant.vault_bump,
+        )?;
+
+        if covenant.counterparty_joined {
+            release_asset(
+                &covenant_key,
+                &covenant.counterparty_asset,
+                &covenant.counterparty_mint,
+                covenant.counterparty_amount,
+                &ctx.accounts.vault.to_account_info(),
+                &ctx.accounts.counterparty,
+                &ctx.accounts.counterparty_vault_ata,
+                &ctx.accounts.counterparty_payout_ata,
+                &ctx.accounts.counterparty_mint_acct,
+                &ctx.accounts.token_program.to_account_info(),
+                covenant.vault_bump,
+            )?;
+        }
+
+        let covenant = &mut ctx.accounts.covenant;
+        covenant.status = CovenantStatus::Reverted;
+        covenant.settled_at = Some(Clock::get()?.unix_timestamp);
+
+        Ok(())
+    }
+
+    /// The creator closes a terminal covenant, reclaiming the covenant PDA's
+    /// lamports (account rent + any leftover permission prefund).
+    pub fn close_covenant(ctx: Context<CloseCovenant>) -> Result<()> {
+        let covenant = &ctx.accounts.covenant;
+
+        require!(
+            ctx.accounts.signer.key() == covenant.creator,
+            ConvenantError::UnauthorizedSigner
+        );
+        require!(
+            covenant.status == CovenantStatus::Reverted
+                || covenant.status == CovenantStatus::SettledOnL1
+                || covenant.status == CovenantStatus::Settling,
+            ConvenantError::InvalidStatus
+        );
+
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -422,4 +498,60 @@ pub struct PermissionContext<'info> {
     /// CHECK: Magic Program
     #[account(address = MAGIC_PROGRAM_ID)]
     pub magic_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CancelCovenant<'info> {
+    #[account(mut)]
+    pub signer: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [COVENANT_SEED, covenant.creator.as_ref(), covenant.nonce.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub covenant: Account<'info, Covenant>,
+    #[account(mut, seeds = [VAULT_SEED, covenant.key().as_ref()], bump)]
+    pub vault: SystemAccount<'info>,
+    /// CHECK: recipients of the refund
+    #[account(mut)]
+    pub creator: UncheckedAccount<'info>,
+    /// CHECK: recipients of the refund
+    #[account(mut)]
+    pub counterparty: UncheckedAccount<'info>,
+    /// CHECK: vault ATA holding the creator's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub creator_vault_ata: UncheckedAccount<'info>,
+    /// CHECK: vault ATA holding the counterparty's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub counterparty_vault_ata: UncheckedAccount<'info>,
+    /// CHECK: creator's payout ATA for the creator's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub creator_payout_ata: UncheckedAccount<'info>,
+    /// CHECK: counterparty's payout ATA for the counterparty's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub counterparty_payout_ata: UncheckedAccount<'info>,
+    /// CHECK: mint account for the creator's SPL offer (decimals); SOL: dummy
+    #[account()]
+    pub creator_mint_acct: UncheckedAccount<'info>,
+    /// CHECK: mint account for the counterparty's SPL offer (decimals)
+    #[account()]
+    pub counterparty_mint_acct: UncheckedAccount<'info>,
+    /// CHECK: legacy SPL Token program
+    #[account()]
+    pub token_program: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CloseCovenant<'info> {
+    #[account(mut)]
+    pub signer: Signer<'info>,
+    #[account(
+        mut,
+        close = signer,
+        seeds = [COVENANT_SEED, covenant.creator.as_ref(), covenant.nonce.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub covenant: Account<'info, Covenant>,
+    pub system_program: Program<'info, System>,
 }
