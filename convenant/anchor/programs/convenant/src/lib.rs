@@ -445,6 +445,109 @@ pub mod convenant {
 
         Ok(())
     }
+
+    /// Once both parties accept, commit the covenant state back to base layer
+    /// and schedule a Magic Action that atomically swaps the vault SOL on the
+    /// base layer. Runs on the ER; the commit + swap land together on L1.
+    pub fn commit_and_swap(ctx: Context<CommitAndSwap>) -> Result<()> {
+        let covenant = &ctx.accounts.covenant;
+
+        require!(
+            covenant.status == CovenantStatus::ActiveOnEr,
+            ConvenantError::InvalidStatus
+        );
+        require!(covenant.both_accepted(), ConvenantError::NotBothAccepted);
+        require!(
+            Clock::get()?.unix_timestamp < covenant.deadline,
+            ConvenantError::DeadlineInPast
+        );
+
+        let action_data = anchor_lang::InstructionData::data(&crate::instruction::SwapOnL1 {});
+        let action_args = ActionArgs::new(action_data);
+        let action_accounts = vec![
+            ShortAccountMeta {
+                pubkey: crate::ID,
+                is_writable: false,
+            },
+            ShortAccountMeta {
+                pubkey: ctx.accounts.covenant.key(),
+                is_writable: true,
+            },
+            ShortAccountMeta {
+                pubkey: ctx.accounts.vault.key(),
+                is_writable: true,
+            },
+            ShortAccountMeta {
+                pubkey: ctx.accounts.creator.key(),
+                is_writable: true,
+            },
+            ShortAccountMeta {
+                pubkey: ctx.accounts.counterparty.key(),
+                is_writable: true,
+            },
+            ShortAccountMeta {
+                pubkey: ctx.accounts.creator_vault_ata.key(),
+                is_writable: true,
+            },
+            ShortAccountMeta {
+                pubkey: ctx.accounts.counterparty_vault_ata.key(),
+                is_writable: true,
+            },
+            ShortAccountMeta {
+                pubkey: ctx.accounts.creator_payout_ata.key(),
+                is_writable: true,
+            },
+            ShortAccountMeta {
+                pubkey: ctx.accounts.counterparty_payout_ata.key(),
+                is_writable: true,
+            },
+            ShortAccountMeta {
+                pubkey: ctx.accounts.creator_mint_acct.key(),
+                is_writable: false,
+            },
+            ShortAccountMeta {
+                pubkey: ctx.accounts.counterparty_mint_acct.key(),
+                is_writable: false,
+            },
+            ShortAccountMeta {
+                pubkey: ctx.accounts.token_program.key(),
+                is_writable: false,
+            },
+            ShortAccountMeta {
+                pubkey: ctx.accounts.system_program.key(),
+                is_writable: false,
+            },
+        ];
+        let action = CallHandler {
+            destination_program: crate::ID,
+            accounts: action_accounts,
+            args: action_args,
+            // Signer that pays the action fees from an escrow PDA derived from
+            // the delegated covenant PDA (verified in swap_on_l1).
+            escrow_authority: ctx.accounts.covenant.to_account_info(),
+            compute_units: 200_000,
+        };
+        // The magic program requires the action's escrow_authority (the
+        // covenant PDA) to sign the ScheduleIntentBundle CPI. Without PDA
+        // seeds the CPI fails `MissingRequiredSignature` on the ER — this is
+        // the runtime commit blocker.
+        let covenant_seeds: &[&[u8]] = &[
+            COVENANT_SEED,
+            ctx.accounts.covenant.creator.as_ref(),
+            &ctx.accounts.covenant.nonce.to_le_bytes(),
+            &[ctx.bumps.covenant],
+        ];
+        MagicIntentBundleBuilder::new(
+            ctx.accounts.payer.to_account_info(),
+            ctx.accounts.magic_context.to_account_info(),
+            ctx.accounts.magic_program.to_account_info(),
+        )
+        .commit(&[ctx.accounts.covenant.to_account_info()])
+        .add_post_commit_actions([action])
+        .build_and_invoke_signed(&[covenant_seeds])?;
+
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -560,6 +663,49 @@ pub struct Negotiate<'info> {
         bump
     )]
     pub covenant: Account<'info, Covenant>,
+}
+
+#[commit]
+#[derive(Accounts)]
+pub struct CommitAndSwap<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [COVENANT_SEED, covenant.creator.as_ref(), covenant.nonce.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub covenant: Account<'info, Covenant>,
+    #[account(mut, seeds = [VAULT_SEED, covenant.key().as_ref()], bump)]
+    pub vault: SystemAccount<'info>,
+    /// CHECK: swap destination
+    #[account(mut)]
+    pub creator: UncheckedAccount<'info>,
+    /// CHECK: swap destination
+    #[account(mut)]
+    pub counterparty: UncheckedAccount<'info>,
+    /// CHECK: vault ATA holding the creator's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub creator_vault_ata: UncheckedAccount<'info>,
+    /// CHECK: vault ATA holding the counterparty's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub counterparty_vault_ata: UncheckedAccount<'info>,
+    /// CHECK: counterparty's payout ATA for the creator's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub creator_payout_ata: UncheckedAccount<'info>,
+    /// CHECK: creator's payout ATA for the counterparty's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub counterparty_payout_ata: UncheckedAccount<'info>,
+    /// CHECK: mint account for the creator's SPL offer (decimals); SOL: dummy
+    #[account()]
+    pub creator_mint_acct: UncheckedAccount<'info>,
+    /// CHECK: mint account for the counterparty's SPL offer (decimals)
+    #[account()]
+    pub counterparty_mint_acct: UncheckedAccount<'info>,
+    /// CHECK: legacy SPL Token program
+    #[account()]
+    pub token_program: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
