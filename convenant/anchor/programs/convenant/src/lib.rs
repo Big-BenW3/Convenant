@@ -612,6 +612,139 @@ pub mod convenant {
 
         Ok(())
     }
+
+    // -----------------------------------------------------------------
+    // Expiry refund (base layer)
+    // -----------------------------------------------------------------
+
+    /// After the deadline with no settlement, either party refunds the vault.
+    pub fn expire_and_refund(ctx: Context<ExpireAndRefund>) -> Result<()> {
+        let covenant = &ctx.accounts.covenant;
+
+        require!(
+            covenant.status == CovenantStatus::CreatedOnL1
+                || covenant.status == CovenantStatus::ActiveOnEr
+                || covenant.status == CovenantStatus::Delegating,
+            ConvenantError::InvalidStatus
+        );
+        require!(
+            Clock::get()?.unix_timestamp >= covenant.deadline,
+            ConvenantError::DeadlineNotPassed
+        );
+        require!(
+            ctx.accounts.signer.key() == covenant.creator
+                || Some(ctx.accounts.signer.key()) == covenant.counterparty,
+            ConvenantError::UnauthorizedSigner
+        );
+
+        let covenant = &ctx.accounts.covenant;
+        let covenant_key = covenant.key();
+
+        // Refund creator's locked asset back to the creator.
+        release_asset(
+            &covenant_key,
+            &covenant.creator_asset,
+            &covenant.creator_mint,
+            covenant.creator_amount,
+            &ctx.accounts.vault.to_account_info(),
+            &ctx.accounts.creator,
+            &ctx.accounts.creator_vault_ata,
+            &ctx.accounts.creator_payout_ata,
+            &ctx.accounts.creator_mint_acct,
+            &ctx.accounts.token_program.to_account_info(),
+            covenant.vault_bump,
+        )?;
+
+        if covenant.counterparty_joined {
+            release_asset(
+                &covenant_key,
+                &covenant.counterparty_asset,
+                &covenant.counterparty_mint,
+                covenant.counterparty_amount,
+                &ctx.accounts.vault.to_account_info(),
+                &ctx.accounts.counterparty,
+                &ctx.accounts.counterparty_vault_ata,
+                &ctx.accounts.counterparty_payout_ata,
+                &ctx.accounts.counterparty_mint_acct,
+                &ctx.accounts.token_program.to_account_info(),
+                covenant.vault_bump,
+            )?;
+        }
+
+        let covenant = &mut ctx.accounts.covenant;
+        covenant.status = CovenantStatus::SettledOnL1;
+        covenant.settled_at = Some(Clock::get()?.unix_timestamp);
+
+        Ok(())
+    }
+
+    /// Create the token account derived for `owner`/`mint` (seeds
+    /// `[owner, token_program, mint]`) on the base layer. Replaces the SPL
+    /// Associated Token Account program, which is not deployed on the
+    /// MagicBlock cluster. Idempotent: no-ops when the account already exists.
+    pub fn create_associated_token_account(
+        ctx: Context<CreateAssociatedTokenAccount>,
+    ) -> Result<()> {
+        let token_program = *ctx.accounts.token_program.key;
+        require!(token_program == SPL_TOKEN_PROGRAM_ID, ConvenantError::InvalidTokenProgram);
+
+        let ata = &ctx.accounts.ata;
+        if ata.lamports() > 0 && ata.owner == &SPL_TOKEN_PROGRAM_ID {
+            return Ok(());
+        }
+
+        let rent = Rent::get()?.minimum_balance(TOKEN_ACCOUNT_SIZE);
+        let bump = ctx.bumps.ata;
+        let owner = *ctx.accounts.owner.key;
+        let mint = *ctx.accounts.mint.key;
+        let signer_seeds: &[&[u8]] = &[
+            owner.as_ref(),
+            token_program.as_ref(),
+            mint.as_ref(),
+            &[bump],
+        ];
+
+        anchor_lang::system_program::create_account(
+            CpiContext::new_with_signer(
+                anchor_lang::system_program::ID,
+                anchor_lang::system_program::CreateAccount {
+                    from: ctx.accounts.payer.to_account_info(),
+                    to: ata.to_account_info(),
+                },
+                &[signer_seeds],
+            ),
+            rent,
+            TOKEN_ACCOUNT_SIZE as u64,
+            &token_program,
+        )?;
+
+        // SPL InitializeAccount3 (tag 18) — the only variant that works on
+        // MagicBlock devnet (tag 0 returns Custom(12)).  Only 3 accounts needed:
+        // [account, mint, owner].  Data: [18, ...owner_pubkey].
+        let mut data = vec![18u8];
+        data.extend_from_slice(&owner.to_bytes());
+        let accounts = vec![
+            AccountMeta::new(ata.key(), false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new_readonly(owner, false),
+        ];
+        let ix = anchor_lang::solana_program::instruction::Instruction {
+            program_id: SPL_TOKEN_PROGRAM_ID,
+            accounts,
+            data,
+        };
+        anchor_lang::solana_program::program::invoke(
+            &ix,
+            &[
+                ata.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.owner.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -640,6 +773,33 @@ pub struct InitializeCovenant<'info> {
     #[account()]
     pub mint_account: UncheckedAccount<'info>,
     /// CHECK: legacy SPL Token program (SOL: unused)
+    #[account()]
+    pub token_program: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CreateAssociatedTokenAccount<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK: derived token account address (seeds owner/token_program/mint)
+    #[account(
+        mut,
+        seeds = [
+            owner.key().as_ref(),
+            token_program.key().as_ref(),
+            mint.key().as_ref(),
+        ],
+        bump
+    )]
+    pub ata: SystemAccount<'info>,
+    /// CHECK: owner of the new token account (a wallet or this program's vault)
+    #[account()]
+    pub owner: UncheckedAccount<'info>,
+    /// CHECK: SPL mint the new account will hold
+    #[account()]
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: legacy SPL Token program
     #[account()]
     pub token_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
@@ -801,6 +961,48 @@ pub struct SwapOnL1<'info> {
     #[account(mut)]
     pub creator_payout_ata: UncheckedAccount<'info>,
     /// CHECK: counterparty's payout ATA for the creator's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub counterparty_payout_ata: UncheckedAccount<'info>,
+    /// CHECK: mint account for the creator's SPL offer (decimals); SOL: dummy
+    #[account()]
+    pub creator_mint_acct: UncheckedAccount<'info>,
+    /// CHECK: mint account for the counterparty's SPL offer (decimals)
+    #[account()]
+    pub counterparty_mint_acct: UncheckedAccount<'info>,
+    /// CHECK: legacy SPL Token program
+    #[account()]
+    pub token_program: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExpireAndRefund<'info> {
+    #[account(mut)]
+    pub signer: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [COVENANT_SEED, covenant.creator.as_ref(), covenant.nonce.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub covenant: Account<'info, Covenant>,
+    #[account(mut, seeds = [VAULT_SEED, covenant.key().as_ref()], bump)]
+    pub vault: SystemAccount<'info>,
+    /// CHECK: recipients of the refund
+    #[account(mut)]
+    pub creator: UncheckedAccount<'info>,
+    /// CHECK: recipients of the refund
+    #[account(mut)]
+    pub counterparty: UncheckedAccount<'info>,
+    /// CHECK: vault ATA holding the creator's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub creator_vault_ata: UncheckedAccount<'info>,
+    /// CHECK: vault ATA holding the counterparty's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub counterparty_vault_ata: UncheckedAccount<'info>,
+    /// CHECK: creator's payout ATA for the creator's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub creator_payout_ata: UncheckedAccount<'info>,
+    /// CHECK: counterparty's payout ATA for the counterparty's SPL offer (SOL: unused)
     #[account(mut)]
     pub counterparty_payout_ata: UncheckedAccount<'info>,
     /// CHECK: mint account for the creator's SPL offer (decimals); SOL: dummy
