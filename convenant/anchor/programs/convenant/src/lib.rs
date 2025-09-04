@@ -548,6 +548,70 @@ pub mod convenant {
 
         Ok(())
     }
+
+    // -----------------------------------------------------------------
+    // Magic Action target — runs on base layer atomically with the commit
+    // -----------------------------------------------------------------
+
+    /// Executes the escrow: moves each party's full locked SOL back out of the
+    /// vault to the opposite party. Guarded by the covenant PDA acting as the
+    /// escrow authority, so only a properly scheduled Magic Action can run it.
+    pub fn swap_on_l1(ctx: Context<SwapOnL1>) -> Result<()> {
+        let covenant = &ctx.accounts.covenant;
+
+        // Only the ER-committed path (which signs with this escrow) may settle.
+        require!(
+            ctx.accounts.escrow_auth.key() == covenant.key(),
+            ConvenantError::UnauthorizedSigner
+        );
+        require!(
+            covenant.status == CovenantStatus::ActiveOnEr,
+            ConvenantError::InvalidStatus
+        );
+        require!(covenant.both_accepted(), ConvenantError::NotBothAccepted);
+        require!(
+            Clock::get()?.unix_timestamp < covenant.deadline,
+            ConvenantError::DeadlineInPast
+        );
+
+        let covenant_key = covenant.key();
+
+        // creator's asset -> counterparty
+        release_asset(
+            &covenant_key,
+            &covenant.creator_asset,
+            &covenant.creator_mint,
+            covenant.creator_amount,
+            &ctx.accounts.vault.to_account_info(),
+            &ctx.accounts.counterparty,
+            &ctx.accounts.creator_vault_ata,
+            &ctx.accounts.counterparty_payout_ata,
+            &ctx.accounts.creator_mint_acct,
+            &ctx.accounts.token_program.to_account_info(),
+            covenant.vault_bump,
+        )?;
+
+        // counterparty's asset -> creator
+        release_asset(
+            &covenant_key,
+            &covenant.counterparty_asset,
+            &covenant.counterparty_mint,
+            covenant.counterparty_amount,
+            &ctx.accounts.vault.to_account_info(),
+            &ctx.accounts.creator,
+            &ctx.accounts.counterparty_vault_ata,
+            &ctx.accounts.creator_payout_ata,
+            &ctx.accounts.counterparty_mint_acct,
+            &ctx.accounts.token_program.to_account_info(),
+            covenant.vault_bump,
+        )?;
+
+        let covenant = &mut ctx.accounts.covenant;
+        covenant.status = CovenantStatus::SettledOnL1;
+        covenant.settled_at = Some(Clock::get()?.unix_timestamp);
+
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -694,6 +758,49 @@ pub struct CommitAndSwap<'info> {
     #[account(mut)]
     pub creator_payout_ata: UncheckedAccount<'info>,
     /// CHECK: creator's payout ATA for the counterparty's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub counterparty_payout_ata: UncheckedAccount<'info>,
+    /// CHECK: mint account for the creator's SPL offer (decimals); SOL: dummy
+    #[account()]
+    pub creator_mint_acct: UncheckedAccount<'info>,
+    /// CHECK: mint account for the counterparty's SPL offer (decimals)
+    #[account()]
+    pub counterparty_mint_acct: UncheckedAccount<'info>,
+    /// CHECK: legacy SPL Token program
+    #[account()]
+    pub token_program: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[action]
+#[derive(Accounts)]
+pub struct SwapOnL1<'info> {
+    #[account(
+        mut,
+        seeds = [COVENANT_SEED, covenant.creator.as_ref(), covenant.nonce.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub covenant: Account<'info, Covenant>,
+    #[account(mut, seeds = [VAULT_SEED, covenant.key().as_ref()], bump)]
+    pub vault: SystemAccount<'info>,
+    /// CHECK: swap destination
+    #[account(mut)]
+    pub creator: UncheckedAccount<'info>,
+    /// CHECK: swap destination
+    #[account(mut)]
+    pub counterparty: UncheckedAccount<'info>,
+    /// CHECK: escrow authority derived from the delegated covenant PDA
+    pub escrow_auth: UncheckedAccount<'info>,
+    /// CHECK: vault ATA holding the creator's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub creator_vault_ata: UncheckedAccount<'info>,
+    /// CHECK: vault ATA holding the counterparty's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub counterparty_vault_ata: UncheckedAccount<'info>,
+    /// CHECK: creator's payout ATA for the counterparty's SPL offer (SOL: unused)
+    #[account(mut)]
+    pub creator_payout_ata: UncheckedAccount<'info>,
+    /// CHECK: counterparty's payout ATA for the creator's SPL offer (SOL: unused)
     #[account(mut)]
     pub counterparty_payout_ata: UncheckedAccount<'info>,
     /// CHECK: mint account for the creator's SPL offer (decimals); SOL: dummy
