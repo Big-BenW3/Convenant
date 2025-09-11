@@ -1,0 +1,57 @@
+# HANDOFF.MD — Private Covenant e2e (MagicBlock devnet TEE)
+
+## 0. Mission and deadline context
+- **Goal (MVP, no scope creep):** get `convenant/scripts/e2e-live.ts` fully green on MagicBlock devnet TEE: Flow A (SOL⇄SOL private covenant: init → join → delegate → init_permission → private reads → update_offer → both accept → **commit_and_swap** → swap_on_l1/SettledOnL1), then Flow B (open join → second-join reject → cancel → close), Flow B2 (expire + refund), Flow C (USDC⇄SOL incl. Flow C commit). Then refresh `FLOW.md` + annotated demo video script (must include USDC/NFT clips).
+- **Do NOT touch:** UI, program business logic, SDK version (`@magicblock-labs/ephemeral-rollups-sdk` stays `0.17.0`), program IDs/ABI. Keep changes minimal; user explicitly said "don't overengineer."
+- **Never commit to git** unless explicitly asked.
+
+## 1. Current state (verified facts, not guesses)
+- Program `2uY6gVNHe62XZXByt796pbwye1p7eTu2Nftv7uwC5CtQ` — delegate fix deployed and green end-to-end (delegation lands, covenant reads `ActiveOnEr` on the TEE).
+- Flow A is green **through negotiation, repeatedly**: init → join (`vault = 0.7500 SOL`) → TEE delegate (`devnet-tee.magicblock.app`) → `init_permission` → private read OK (`creatorLock=0.5000 SOL status=2`) → unauthenticated read correctly denied → `update_offer` ("offer updated to 0.3 SOL") → both accepted. Last green run: covenant `CWU47Pja2rC2`, init sig `eX472FuW…`, join `6RV9FxJ…`, delegate `4ZMN9X…`, init_permission `DHjpPp1…`.
+- **Single blocker:** `commit_and_swap` sent to the ER fails every time with `{"InstructionError":["0","MissingRequiredSignature"]}` (latest failing sig `2u2sWYEP…`). Fails identically WITH and WITHOUT the `patchCommitIx` experiment.
+- Evidence on the failure: the failing tx's inner instruction is the magic-program CPI (programIdIndex 7, accounts `[0,5,3]`) produced inside our program's `#[commit]` expansion (`lib.rs:~533`, `build_and_invoke` passing `ctx.accounts.magic_context`). The commit ix has 15 accounts with `magicContext` last (confirmed by the `[debug] ix accounts` dump).
+- SDK source ground truths (`convenant/node_modules/@magicblock-labs/ephemeral-rollups-sdk/lib`): `MAGIC_CONTEXT_ID = "MagicContext1111111111111111111111111111111"` (static literal); `commitPermission.js` marks it `isSigner:false`; `scheduleCommit.js` (`createCommitInstruction`) builds `[payer(signer+writable), MAGIC_CONTEXT(writable, non-signer), ...accountsToCommit(readonly)]`.
+- Anchor 1.1.2 error taxonomy (from `~/.cargo/registry/.../anchor-lang-error-1.1.2/src/lib.rs`): framework codes are 100+ (instructions), 2000+ (constraints), 3000+ (accounts); user `#[error_code]` offset is 6000. Therefore `Custom(1)` is NOT an Anchor/user error — it is a transaction-level or CPI-level signature error. Our IDL (`anchor/target/idl/convenant.json`) confirms user errors start at 6000 (`InvalidStatus` = 6001) and the instruction name is `commit_and_swap`.
+- Working reference (`magicblock-engine-examples`, `private-counter.ts`, "Commit counter state on ER to Solana" test): build with `program.methods.commit().accountsPartial({payer, counter})`, set `feePayer = ER wallet`, fetch fresh ER blockhash, `wallet.signTransaction(tx)` (payer signs only), `sendAndConfirm(tx, [], {skipPreflight:true})`. Only one client signature.
+
+## 2. Error history — every failure and its real cause (do not re-debug these)
+1. `PrivilegeEscalation` on delegate → caused by typed `Account<'info>` + seeds on the `#[account(del)]` field → fixed with `UncheckedAccount<'info>` + `#[account(mut, del)]`, no seeds (canonical `private-counter` pattern). PDA re-derived in handler via `find_program_address([COVENANT_SEED, creator, nonce.to_le_bytes()])`, enforced with `CovenantPdaMismatch` (errors.rs). Delegate seeds exclude the bump.
+2. `BorshIoError` in delegate handler → `Covenant::try_from_slice` fails with "Not all bytes read": account is 227 bytes (8 discriminator + Covenant fields + 8 trailing zeros) → fixed with explicit discriminator check + `Covenant::deserialize(&mut &data[8..])`.
+3. `ExternalAccountDataModified` → status write AFTER delegation (account is DLP-owned then; non-owner write rejected) → fixed by setting `ActiveOnEr` + serializing BEFORE the delegate call (DLP `copy_from_slice` restores buffer data, carrying the status to the ER — verified in `/tmp/opencode/dlp-delegate.rs`, `src/processor/fast/delegate.rs`).
+4. Commit `MissingRequiredSignature` (OPEN, current) → see §4.
+5. Join `Custom(1)` twice → RED HERRING, twice: first was system `Transfer: insufficient lamports 249910000, need 250000000` (CP wallet at 0.2499 SOL; fixed by airdrop to ~1.25–2.25 SOL). Second identical-looking failure was the creator wallet drained to 0.4446 SOL (init needs ~0.7: 0.5 lock + permission rent + fees; topped to ~1.44). Always check balances first — tx-log fetch (`getTransaction` on the right RPC) beats guessing.
+6. E2E infra fixes already in place: `sendIxsRaw` confirm loop is direct (`getSignatureStatuses` → `getSignaturesForAddress` fallback, throws fast, `jsonSafe` for BigInt); `httpsFetch` polyfill forces IPv4 (`family:4`) + zlib + GET default (SDK `getAuthToken` challenge endpoint needs GET); FQDN normalization strips `https://` prefix/trailing path (router returned `https://https://devnet-tee…`); every ER call carries `?token=` (creator token for sends, CP token `erRpcCp` for private reads); post-delegation state reads MUST use `readCovenantEr()` on the tokenized ER (base RPC is stale until commit); `creatorWeb3` keypair added for creator TEE challenge signing.
+
+## 3. Dirty working tree (next agent: keep vs revert)
+Only `convenant/scripts/e2e-live.ts` is dirty; the program is untouched since the delegate fix (no rebuild/redeploy needed):
+- `patchCommitIx()` helper (~line 319) forcing `magicContext.isSigner=true`, currently applied to Flow A + Flow C commits. **Unproven experiment — see §4 before keeping.**
+- Debug noise to DELETE once green: `[debug] ix accounts` dump in `sendIxsRaw`, `pre-join covenant` log, `sleep(3000)` before join, endpoint tag in error strings, `tryFetchTxLogs()` helper (kept returning empty — verify its response-shape parsing against the real ER `getTransaction` payload).
+- `npx tsc --noEmit` is clean. Type of `patchCommitIx` had to be `(ix: any): any` (spread over index-signature types drops `programAddress`).
+
+## 4. The one open problem: commit `MissingRequiredSignature` — diagnosis plan in order
+- Fact: identical error WITH patch (message header presumably 2 required sigs / 1 provided → fails at tx level) and WITHOUT patch (1-and-1 → must fail inside, i.e. the magic CPI needs an outer signer that isn't marked). Same string, two different stages — stop treating them as one failure.
+- Step 1 (cheapest, decisive): on the next run, fetch the failed commit tx from the **ER tokenized endpoint** (base RPC returns `null` for ER txs) and read: `message.header.numRequiredSignatures` vs `signatures[]` length, `meta.err`, `meta.innerInstructions`, `logMessages`. This tells you tx-level (header=2/sigs=1 → our patch caused it; the ER did not co-sign) vs CPI-level (header=1/sigs=1 → the magic CPI at `lib.rs:~533` needs an outer account marked signer).
+- Step 2a (if tx-level): the ER won't co-sign raw sends. Inspect SDK `magic-router.js` / `resolver.js` for a commit-specific send path (headers/preflight/wrapping) and mirror it.
+- Step 2b (fallback, highest confidence): replicate the reference exactly with an Anchor TS client — `program.methods.commit_and_swap(...).accountsPartial(...)`, `feePayer = creator`, `wallet.signTransaction`, `sendAndConfirm(tx, [], {skipPreflight:true})` — replacing the kit `compileTransaction` path for the commit only. Partial-signature serialization is the most likely behavioral difference.
+- Step 3 (if CPI-level): verify the CPI account order built at `lib.rs:~533` against the magic program's expected `[payer, magic_context, ...]`; test `patchCommitIx` variants (writable+signer vs readonly+signer).
+- Step 4 (last resort only): test appending the SDK's `createCommitInstruction(payer, [covenant, …])` after `commitIx` in the same ER tx. Low probability — the `#[commit]` expansion already performs the magic CPI (seen as inner ix).
+
+## 5. After commit goes green (in order)
+1. Assert `SettledOnL1` + vault settlement balances on base; run `SwapOnL1` (`#[action]`, lib.rs ~926–967).
+2. Flow B (open join → second-joiner reject → cancel → close), Flow B2 (expire + refund), Flow C (USDC⇄SOL incl. Flow C commit at ~line 1070).
+3. Remove all debug edits from `e2e-live.ts`, full green run, then refresh `FLOW.md` + annotated demo video script (USDC/NFT clips required).
+
+## 6. Environment cheat sheet
+- Wallets: creator `FJTwNFddjUy3Ur9csceLsTzUbC35R389qYkXtXFK5XDU`, CP `J3pXqcm3qexhx5UYVNAgCrw9RGGcnPwgTmW6UzvvwuTe`; keys `/tmp/opencode/e2e-creator.json`, `/tmp/opencode/e2e-cp.json`. Costs/run: creator ≥ ~0.7 SOL, CP ≥ ~0.3 SOL.
+- Funding: ONLY `requestAirdrop` on `https://rpc.magicblock.app/devnet` (1 SOL/req, retry until balance moves — returned sigs sometimes never land), over **IPv4** (`family:4`; plain undici fetch fails with ETIMEDOUT/ENETUNREACH). Public `api.devnet.solana.com` refuses these wallets. TEE challenge signing uses legacy `tweetnacl` + bs58 with raw secret bytes.
+- Endpoints: base `https://rpc.magicblock.app/devnet`; router `https://devnet-router.magicblock.app/`; TEE `https://devnet-tee.magicblock.app/`; validator `MTEWGuqxUpYZGFJQcp8tLN7x5v9BSeoFHYWQQ3n3xzo`. Program IDs: convenant `2uY6…C5CtQ`, ACL/PERMISSION `ACLseoPoyC3cBqoUtkbjZ4aDrkurZW86v19pXz2XQnp1`, DLP `DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh`, MAGIC `Magic1111…`, CONTEXT `MagicContext1111…`, TOKEN `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`, EPHEMERAL_VAULT `MagicVau1t9999…`. Covenant statuses: CreatedOnL1=0, Delegating=1, ActiveOnEr=2, Settling=3, SettledOnL1=4, Reverted=5; AssetType Sol=0/Token=1/Nft=2. Covenant account: 227 bytes, 8 trailing zeros.
+- Demo mints: USDC `5P99ZytaHyjfkcx5tp1yU2ZdKRCiNrvgDNBzz4dNkuU7` (6dp, `/tmp/opencode/demo-usdc.json`), NFT `83o191eNgqRQWnEUHpRznTkbvXooVDNbPir8kH2EFW7p` (`/tmp/opencode/demo-nft.json`), payer `DztJxBybR7fKa9UyR8fBZMohaZYcLydyxrJr5CuJBa34`.
+
+## 7. Key paths
+- `convenant/scripts/e2e-live.ts` (~1117 lines; Flow A commit ~660–680, Flow C commit ~1070; helpers: `sendIxsRaw` ~152, `pollCovenant`, `readCovenantEr`, `patchCommitIx` ~319)
+- `convenant/anchor/programs/convenant/src/lib.rs` (1065 lines: `delegate_covenant` ~205–274, `DelegateCovenant` ~800, `PermissionContext` ~819–846, `CommitAndSwap` 883–924 with `#[commit]`, `SwapOnL1` ~926–967 with `#[action]`, commit CPI ~533)
+- `convenant/anchor/programs/convenant/src/errors.rs` (`CovenantPdaMismatch`)
+- `convenant/app/generated/convenant/instructions/commitAndSwap.ts` (`originalAccounts` ~250–280, resolver ~300–308, `getAccountMetaFactory` ~310)
+- `convenant/app/lib/magicblock.ts` (`getAuthTokenFor` ~101, `fetchPrivateAccount`, `getDelegationStatus`, `pickTeeValidator`), `convenant/app/lib/covenant.ts` (PDA/ATA helpers)
+- `convenant/anchor/target/idl/convenant.json`; SDK auth: `node_modules/@magicblock-labs/ephemeral-rollups-sdk/lib/access-control/auth.js`
+- References: `private-counter` program + tests, `magic-actions` tests (single-payer `sendAndConfirm` on ER), `/tmp/opencode/dlp-delegate.rs`
