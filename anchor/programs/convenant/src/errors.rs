@@ -48,4 +48,10 @@ pub enum ConvenantError {
     InvalidTokenProgram,
     #[msg("The provided covenant PDA does not match the covenant seeds")]
     CovenantPdaMismatch,
+    #[msg("The provided creator account does not match the covenant")]
+    CreatorMismatch,
+    #[msg("The provided counterparty account does not match the covenant")]
+    CounterpartyMismatch,
+    #[msg("The provided escrow authority is not the covenant PDA")]
+    EscrowAuthorityMismatch,
 }

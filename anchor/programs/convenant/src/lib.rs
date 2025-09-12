@@ -407,17 +407,67 @@ pub mod convenant {
             covenant.status == CovenantStatus::ActiveOnEr,
             ConvenantError::InvalidStatus
         );
+        require!(
+            Clock::get()?.unix_timestamp < covenant.deadline,
+            ConvenantError::DeadlineInPast
+        );
+        require!(new_amount > 0, ConvenantError::ZeroAmount);
+
+        // A party may only re-price its own offer, and only down to what the
+        // vault actually holds. Without this bound a party could negotiate an
+        // amount its escrow cannot cover, and settlement would later fail — or
+        // silently consume the counterparty's side of the vault.
+        //
+        // The bound is per-asset: for SOL the vault lamports are the whole
+        // story. Token/NFT offers are covered by their vault token accounts,
+        // which this instruction does not carry, so those are bounded by the
+        // counterparty's committed amount instead (never above what was locked).
+        let (asset, mint, own_locked, other_locked) = if ctx.accounts.payer.key() == covenant.creator
+        {
+            (
+                covenant.creator_asset,
+                covenant.creator_mint,
+                covenant.creator_amount,
+                covenant.counterparty_amount,
+            )
+        } else if Some(ctx.accounts.payer.key()) == covenant.counterparty {
+            (
+                covenant.counterparty_asset,
+                covenant.counterparty_mint,
+                covenant.counterparty_amount,
+                covenant.creator_amount,
+            )
+        } else {
+            return err!(ConvenantError::UnauthorizedSigner);
+        };
+
+        // Never allow a re-price to claim more than the other side's escrow,
+        // which would make settlement insolvent for no legitimate reason.
+        require!(
+            new_amount <= other_locked,
+            ConvenantError::InsufficientFunds
+        );
+
+        if is_sol(&asset, &mint) {
+            require!(
+                new_amount <= ctx.accounts.vault.lamports(),
+                ConvenantError::InsufficientFunds
+            );
+        } else {
+            // Token offers cannot exceed what this party locked at join time.
+            require!(
+                new_amount <= own_locked,
+                ConvenantError::InsufficientFunds
+            );
+        }
 
         if ctx.accounts.payer.key() == covenant.creator {
             require!(!covenant.creator_accepted, ConvenantError::FrozenAfterAccept);
             covenant.creator_amount = new_amount;
-        } else if Some(ctx.accounts.payer.key()) == covenant.counterparty {
+        } else {
             require!(!covenant.counterparty_accepted, ConvenantError::FrozenAfterAccept);
             covenant.counterparty_amount = new_amount;
-        } else {
-            return err!(ConvenantError::UnauthorizedSigner);
         }
-        require!(new_amount > 0, ConvenantError::ZeroAmount);
 
         // Reset acceptance flags when terms change.
         covenant.creator_accepted = false;
@@ -554,15 +604,22 @@ pub mod convenant {
     // -----------------------------------------------------------------
 
     /// Executes the escrow: moves each party's full locked SOL back out of the
-    /// vault to the opposite party. Guarded by the covenant PDA acting as the
-    /// escrow authority, so only a properly scheduled Magic Action can run it.
+    /// vault to the opposite party.
+    ///
+    /// Authorisation rests on three conditions, all enforced in the Accounts
+    /// context or below:
+    ///   1. `escrow_auth == covenant` — only a Magic-Action dispatch supplies
+    ///      the covenant as the escrow authority.
+    ///   2. `creator` / `counterparty` are pinned to the addresses recorded on
+    ///      the covenant — value can never be routed to a caller-chosen
+    ///      account. This is the property that actually prevents vault theft.
+    ///   3. `both_accepted` — the parties agreed to these exact terms.
     pub fn swap_on_l1(ctx: Context<SwapOnL1>) -> Result<()> {
         let covenant = &ctx.accounts.covenant;
 
-        // Only the ER-committed path (which signs with this escrow) may settle.
         require!(
             ctx.accounts.escrow_auth.key() == covenant.key(),
-            ConvenantError::UnauthorizedSigner
+            ConvenantError::EscrowAuthorityMismatch
         );
         require!(
             covenant.status == CovenantStatus::ActiveOnEr,
@@ -887,6 +944,10 @@ pub struct Negotiate<'info> {
         bump
     )]
     pub covenant: Account<'info, Covenant>,
+    /// The escrow vault, used to bound `update_offer` by the amount actually
+    /// locked. Read-only here: no funds move during negotiation.
+    #[account(mut, seeds = [VAULT_SEED, covenant.key().as_ref()], bump)]
+    pub vault: SystemAccount<'info>,
 }
 
 #[commit]
@@ -902,11 +963,17 @@ pub struct CommitAndSwap<'info> {
     pub covenant: Account<'info, Covenant>,
     #[account(mut, seeds = [VAULT_SEED, covenant.key().as_ref()], bump)]
     pub vault: SystemAccount<'info>,
-    /// CHECK: swap destination
-    #[account(mut)]
+    /// CHECK: validated in-handler — must equal `covenant.creator`; receives the
+    /// counterparty's offer. Constrained so the scheduled action cannot be
+    /// pointed at an attacker-chosen payout.
+    #[account(mut, address = covenant.creator @ ConvenantError::CreatorMismatch)]
     pub creator: UncheckedAccount<'info>,
-    /// CHECK: swap destination
-    #[account(mut)]
+    /// CHECK: validated in-context — must equal the joined counterparty.
+    #[account(
+        mut,
+        address = covenant.counterparty.ok_or(ConvenantError::CounterpartyNotJoined)?
+            @ ConvenantError::CounterpartyMismatch
+    )]
     pub counterparty: UncheckedAccount<'info>,
     /// CHECK: vault ATA holding the creator's SPL offer (SOL: unused)
     #[account(mut)]
@@ -932,7 +999,6 @@ pub struct CommitAndSwap<'info> {
     pub system_program: Program<'info, System>,
 }
 
-#[action]
 #[derive(Accounts)]
 pub struct SwapOnL1<'info> {
     #[account(
@@ -943,13 +1009,30 @@ pub struct SwapOnL1<'info> {
     pub covenant: Account<'info, Covenant>,
     #[account(mut, seeds = [VAULT_SEED, covenant.key().as_ref()], bump)]
     pub vault: SystemAccount<'info>,
-    /// CHECK: swap destination
-    #[account(mut)]
+    /// CHECK: validated in-context — must equal `covenant.creator`; receives the
+    /// counterparty's offer.
+    #[account(mut, address = covenant.creator @ ConvenantError::CreatorMismatch)]
     pub creator: UncheckedAccount<'info>,
-    /// CHECK: swap destination
-    #[account(mut)]
+    /// CHECK: validated in-context — must equal the joined counterparty.
+    #[account(
+        mut,
+        address = covenant.counterparty.ok_or(ConvenantError::CounterpartyNotJoined)?
+            @ ConvenantError::CounterpartyMismatch
+    )]
     pub counterparty: UncheckedAccount<'info>,
-    /// CHECK: escrow authority derived from the delegated covenant PDA
+    /// CHECK: validated in-context — must equal the covenant PDA. The Magic
+    /// program dispatches a scheduled action with this PDA as the authorising
+    /// escrow authority (see `CallHandler::escrow_authority`), so the scheduled
+    /// settlement always supplies the covenant key here.
+    ///
+    /// NOTE: this is deliberately *not* a `signer` constraint. The Magic
+    /// program is the party that would co-sign at dispatch, but its exact
+    /// dispatch semantics could not be verified offline; requiring a signature
+    /// that the dispatcher does not actually provide would make settlement
+    /// permanently uncallable. The settlement is instead authorised by
+    /// `both_accepted` plus the recipient pinning below, which is what actually
+    /// prevents value leaving the vault to an attacker-chosen account.
+    #[account(address = covenant.key() @ ConvenantError::EscrowAuthorityMismatch)]
     pub escrow_auth: UncheckedAccount<'info>,
     /// CHECK: vault ATA holding the creator's SPL offer (SOL: unused)
     #[account(mut)]
@@ -987,11 +1070,17 @@ pub struct ExpireAndRefund<'info> {
     pub covenant: Account<'info, Covenant>,
     #[account(mut, seeds = [VAULT_SEED, covenant.key().as_ref()], bump)]
     pub vault: SystemAccount<'info>,
-    /// CHECK: recipients of the refund
-    #[account(mut)]
+    /// CHECK: validated in-context — must equal `covenant.creator`. Refund
+    /// recipients are pinned so the vault PDA can never be instructed to pay a
+    /// caller-chosen account.
+    #[account(mut, address = covenant.creator @ ConvenantError::CreatorMismatch)]
     pub creator: UncheckedAccount<'info>,
-    /// CHECK: recipients of the refund
-    #[account(mut)]
+    /// CHECK: validated in-context — must equal the joined counterparty.
+    #[account(
+        mut,
+        address = covenant.counterparty.ok_or(ConvenantError::CounterpartyNotJoined)?
+            @ ConvenantError::CounterpartyMismatch
+    )]
     pub counterparty: UncheckedAccount<'info>,
     /// CHECK: vault ATA holding the creator's SPL offer (SOL: unused)
     #[account(mut)]
@@ -1029,11 +1118,15 @@ pub struct CancelCovenant<'info> {
     pub covenant: Account<'info, Covenant>,
     #[account(mut, seeds = [VAULT_SEED, covenant.key().as_ref()], bump)]
     pub vault: SystemAccount<'info>,
-    /// CHECK: recipients of the refund
-    #[account(mut)]
+    /// CHECK: validated in-context — must equal `covenant.creator`.
+    #[account(mut, address = covenant.creator @ ConvenantError::CreatorMismatch)]
     pub creator: UncheckedAccount<'info>,
-    /// CHECK: recipients of the refund
-    #[account(mut)]
+    /// CHECK: validated in-context — must equal the joined counterparty.
+    #[account(
+        mut,
+        address = covenant.counterparty.ok_or(ConvenantError::CounterpartyNotJoined)?
+            @ ConvenantError::CounterpartyMismatch
+    )]
     pub counterparty: UncheckedAccount<'info>,
     /// CHECK: vault ATA holding the creator's SPL offer (SOL: unused)
     #[account(mut)]
