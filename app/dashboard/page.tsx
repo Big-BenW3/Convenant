@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { address, unwrapOption } from "@solana/kit";
 import type { Covenant } from "../generated/convenant";
@@ -43,7 +43,14 @@ const KIND_STYLE: Record<
 export default function DashboardPage() {
   const { signer, status } = useWallet();
   const { cluster, getExplorerUrl } = useCluster();
-  const readRpc = createReadRpc(getClusterUrl(cluster));
+  // Memoized: building a client per render would hand `refreshFor` a new
+  // identity every time and defeat the effect dependency below.
+  const readRpc = useMemo(() => createReadRpc(getClusterUrl(cluster)), [cluster]);
+
+  // Guards against out-of-order refreshes: two overlapping calls (mount effect
+  // plus the refresh button) could otherwise resolve backwards and leave stale
+  // rows on screen.
+  const refreshSeq = useRef(0);
 
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(false);
@@ -52,6 +59,7 @@ export default function DashboardPage() {
   const connected = status === "connected" && !!signer;
 
   const refreshFor = async (ids: string[]) => {
+    const seq = ++refreshSeq.current;
     setLoading(true);
     try {
       const next: Row[] = await Promise.all(
@@ -71,9 +79,9 @@ export default function DashboardPage() {
           }
         })
       );
-      setRows(next);
+      if (seq === refreshSeq.current) setRows(next);
     } finally {
-      setLoading(false);
+      if (seq === refreshSeq.current) setLoading(false);
     }
   };
 
@@ -84,8 +92,7 @@ export default function DashboardPage() {
       const t = setTimeout(() => void refreshFor(ids), 0);
       return () => clearTimeout(t);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connected]);
+  }, [connected, readRpc]);
 
   const addCovenant = () => {
     const id = input.trim();

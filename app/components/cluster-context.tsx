@@ -2,9 +2,10 @@
 
 import {
   createContext,
-  useContext,
-  useState,
   useCallback,
+  useContext,
+  useMemo,
+  useState,
   type ReactNode,
 } from "react";
 import type { ClusterMoniker } from "../lib/solana-client";
@@ -45,13 +46,14 @@ export function ClusterProvider({ children }: { children: ReactNode }) {
     [cluster]
   );
 
-  return (
-    <ClusterContext.Provider
-      value={{ cluster, setCluster, getExplorerUrl: explorerUrl }}
-    >
-      {children}
-    </ClusterContext.Provider>
+  // Memoized: an inline object literal gives every consumer a new context
+  // value on each provider render, re-rendering the whole tree.
+  const value = useMemo(
+    () => ({ cluster, setCluster, getExplorerUrl: explorerUrl }),
+    [cluster, setCluster, explorerUrl]
   );
+
+  return <ClusterContext.Provider value={value}>{children}</ClusterContext.Provider>;
 }
 
 export function useCluster() {
