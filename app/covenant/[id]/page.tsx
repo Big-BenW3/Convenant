@@ -24,7 +24,8 @@ import {
   vaultAddress,
   settlementAccounts,
   ataAddress,
-  createAtaInstruction,
+  buildCreateTokenAccount,
+  settlementTokenAccountSetup,
   statusMeta,
   formatAmount,
   assetLabel,
@@ -220,9 +221,14 @@ export default function CovenantDetailPage() {
 
       const myAta = mySol ? (SOL_DUMMY as never) : await ataAddress(s.address, myMint);
       const vaultAta = mySol ? (SOL_DUMMY as never) : await ataAddress(vault, myMint);
-      const createAtaIx = mySol
-        ? undefined
-        : createAtaInstruction(s.address, vault, myMint, vaultAta as never);
+      // The vault's token account must exist before the lock transfers into it.
+      // Both creations are idempotent on chain.
+      const setupIxs = mySol
+        ? []
+        : [
+            await buildCreateTokenAccount(s, s.address, myMint),
+            await buildCreateTokenAccount(s, vault, myMint),
+          ];
 
       const ix = await getJoinCovenantInstructionAsync({
         counterparty: s,
@@ -238,7 +244,7 @@ export default function CovenantDetailPage() {
         counterpartyMint: myMint as never,
         counterpartyAmount: BigInt(amount),
       });
-      return send({ instructions: createAtaIx ? [createAtaIx, ix] : [ix] });
+      return send({ instructions: [...setupIxs, ix] });
     });
 
   const doDelegate = () =>
@@ -276,6 +282,7 @@ export default function CovenantDetailPage() {
 
   const doCommit = () =>
     run("commit-and-swap", async (s) => {
+      if (!cpAddr) throw new Error("Waiting for the counterparty to join.");
       const vault = await vaultAddress(covenantKey);
       const accts = await settlementAccounts(covenant, vault, "swap");
       const ix = await getCommitAndSwapInstructionAsync({
@@ -283,7 +290,7 @@ export default function CovenantDetailPage() {
         covenant: covenantKey,
         vault,
         creator: covenant.creator,
-        counterparty: cpAddr!,
+        counterparty: cpAddr,
         creatorVaultAta: accts.creatorVaultAta,
         counterpartyVaultAta: accts.counterpartyVaultAta,
         creatorPayoutAta: accts.creatorPayoutAta,
@@ -295,11 +302,20 @@ export default function CovenantDetailPage() {
         magicProgram: address(MAGIC_PROGRAM_ID),
         magicContext: address(MAGIC_CONTEXT_ID),
       });
+
+      // The magic action runs on the base layer, so the vault's holding account
+      // and both payout accounts must already exist there. The commit itself is
+      // sent to the ER, so the setup is a separate base-layer transaction.
+      const setup = await settlementTokenAccountSetup(s, covenant, accts, "swap");
+      if (setup.length > 0) {
+        await send({ instructions: setup });
+      }
       return sendEr({ instructions: [ix] });
     });
 
   const doExpire = () =>
     run("expire", async (s) => {
+      if (!cpAddr) throw new Error("Waiting for the counterparty to join.");
       const vault = await vaultAddress(covenantKey);
       const accts = await settlementAccounts(covenant, vault, "refund");
       const ix = await getExpireAndRefundInstructionAsync({
@@ -307,7 +323,7 @@ export default function CovenantDetailPage() {
         covenant: covenantKey,
         vault,
         creator: covenant.creator,
-        counterparty: cpAddr!,
+        counterparty: cpAddr,
         creatorVaultAta: accts.creatorVaultAta,
         counterpartyVaultAta: accts.counterpartyVaultAta,
         creatorPayoutAta: accts.creatorPayoutAta,
@@ -317,7 +333,9 @@ export default function CovenantDetailPage() {
         tokenProgram: address(TOKEN_PROGRAM_ID),
         systemProgram: address(SYSTEM_PROGRAM_ID),
       });
-      return send({ instructions: [ix] });
+      // Refund executes on the base layer in this same transaction.
+      const setup = await settlementTokenAccountSetup(s, covenant, accts, "refund");
+      return send({ instructions: [...setup, ix] });
     });
 
   return (

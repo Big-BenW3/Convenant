@@ -41,7 +41,7 @@ import {
   SOL_DUMMY,
   covenantAddress,
   createReadRpc,
-  createAtaInstruction,
+  buildCreateTokenAccount,
   ataAddress,
   permissionAddress,
   readCovenant,
@@ -1091,7 +1091,7 @@ async function main() {
   const creatorUsdcAta = await ataAddress(creator.address, usdcMint);
   const cpSolAta = SOL_DUMMY;
   step("create vault USDC ATA");
-  const createAtaIx = createAtaInstruction(creator.address, vault4, usdcMint, vaultUsdcAta);
+  const createAtaIx = await buildCreateTokenAccount(creator, vault4, usdcMint);
   await l1Client(creator).send([createAtaIx]);
   // Verify ATA exists.
   const ataInfo = await fullRpc.getAccountInfo(vaultUsdcAta).send();

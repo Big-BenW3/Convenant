@@ -13,6 +13,7 @@ import {
   covenantAddress,
   vaultAddress,
   ataAddress,
+  buildCreateTokenAccount,
   SYSTEM_PROGRAM_ID,
   DEMO_MINTS,
 } from "../lib/covenant";
@@ -86,6 +87,21 @@ export default function CreatePage() {
               SPL_MINTS[asset],
             ];
 
+      // The creator's own token account and the vault's must both exist before
+      // `initialize_covenant` locks the asset into the vault. Creation is
+      // idempotent, so pre-creating an existing account is a no-op.
+      const setupIxs =
+        asset === "SOL"
+          ? []
+          : [
+              await buildCreateTokenAccount(
+                signer,
+                signer.address,
+                SPL_MINTS[asset],
+              ),
+              await buildCreateTokenAccount(signer, vault, SPL_MINTS[asset]),
+            ];
+
       const creatorAsset =
         asset === "SOL"
           ? AssetType.Sol
@@ -110,7 +126,7 @@ export default function CreatePage() {
         nonce,
       });
 
-      const sig = await send({ instructions: [instruction] });
+      const sig = await send({ instructions: [...setupIxs, instruction] });
       setConfirmed({ address: created, sig });
     } catch (err) {
       console.error(err);

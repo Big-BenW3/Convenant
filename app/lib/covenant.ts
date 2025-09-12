@@ -1,17 +1,18 @@
 import {
+  address,
   getProgramDerivedAddress,
   getAddressEncoder,
   createRpc,
   createSolanaRpcApi,
   createDefaultRpcTransport,
   DEFAULT_RPC_CONFIG,
-  AccountRole,
   unwrapOption,
   type Address,
   type Rpc,
   type GetAccountInfoApi,
   type Instruction,
   type Option,
+  type TransactionSigner,
 } from "@solana/kit";
 import {
   AssetType,
@@ -20,6 +21,7 @@ import {
   findCovenantPda,
   findVaultPda,
   fetchMaybeCovenant,
+  getCreateAssociatedTokenAccountInstructionAsync,
   type Covenant,
 } from "../generated/convenant";
 
@@ -35,7 +37,13 @@ export const PROGRAM_ID = CONVENANT_PROGRAM_ADDRESS;
 /** Legacy SPL Token program (our contract manually derives ATAs against it). */
 export const TOKEN_PROGRAM_ID =
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" as const;
-/** Associated Token Account: this program derives and creates them. */
+/**
+ * Owner of every derived token account. MagicBlock does not deploy the SPL
+ * Associated Token Account program, so Convenant derives its own token
+ * accounts under itself and creates them via
+ * `create_associated_token_account`. Despite the historical name this is NOT
+ * the SPL ATA program address.
+ */
 export const ATA_PROGRAM_ID = PROGRAM_ID;
 /** System program (SOL mint sentinel). */
 export const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111" as const;
@@ -95,12 +103,14 @@ export async function permissionAddress(covenant: Address): Promise<Address> {
   return pda;
 }
 
-/** Standard SPL associated token account for (owner, mint). */
+/**
+ * Token account for `owner` holding `mint`, derived exactly as the program does
+ * it: `PDA([owner, token_program, mint])` under the Convenant program id.
+ */
 export async function ataAddress(
   owner: Address,
   mint: Address,
 ): Promise<Address> {
-  // SPL ATA derivation: PDA(seeds = [owner, TokenProgram, mint], ATA program).
   const [pda] = await getProgramDerivedAddress({
     programAddress: ATA_PROGRAM_ID as Address,
     seeds: [
@@ -113,33 +123,28 @@ export async function ataAddress(
 }
 
 /**
- * ATA-program `create` instruction (empty data). The contract never creates
- * ATAs itself — the client must pre-create the vault's ATA before locking
- * an SPL/NFT asset. Mirrors the spl-associated-token-account CPI layout:
- * `[payer(signer), ata(writable), owner, mint, system, tokenProgram]`.
+ * Build the instruction that creates a program-derived token account.
+ *
+ * MagicBlock does not deploy the SPL Associated Token Account program, so this
+ * program derives its own token accounts under seeds
+ * `[owner, token_program, mint]` and creates them on-chain. The instruction is
+ * idempotent, so it is safe to prepend ahead of a lock or a settlement.
+ *
+ * `owner` may be a wallet or the covenant vault PDA.
  */
-export function createAtaInstruction(
-  payer: Address,
+export async function buildCreateTokenAccount(
+  payer: TransactionSigner,
   owner: Address,
   mint: Address,
-  ata: Address,
-): Instruction {
-  const keys: Array<{
-    address: Address;
-    role: AccountRole;
-  }> = [
-    { address: payer, role: AccountRole.WRITABLE_SIGNER },
-    { address: ata, role: AccountRole.WRITABLE },
-    { address: owner, role: AccountRole.READONLY },
-    { address: mint, role: AccountRole.READONLY },
-    { address: SYSTEM_PROGRAM_ID as Address, role: AccountRole.READONLY },
-    { address: TOKEN_PROGRAM_ID as Address, role: AccountRole.READONLY },
-  ];
-  return {
-    programAddress: ATA_PROGRAM_ID as Address,
-    accounts: keys,
-    data: new Uint8Array(),
-  };
+): Promise<Instruction> {
+  return getCreateAssociatedTokenAccountInstructionAsync({
+    payer,
+    ata: await ataAddress(owner, mint),
+    owner,
+    mint,
+    tokenProgram: address(TOKEN_PROGRAM_ID),
+    systemProgram: address(SYSTEM_PROGRAM_ID),
+  });
 }
 
 /** True when an asset+mint pair represents native SOL. */
@@ -240,6 +245,47 @@ export async function settlementAccounts(
     counterpartyMintAcct: cpSol ? (SOL_DUMMY as Address) : c.counterpartyMint,
     vault,
   };
+}
+
+/**
+ * Token accounts that must exist before a settlement or refund can move SPL /
+ * NFT value. `release_asset` transfers into a payout account, so each side's
+ * destination has to be an initialised token account or the transfer fails.
+ *
+ * `accounts` must be the same object passed to the settlement instruction; the
+ * owner/mint pairs are re-derived from the covenant so the accounts created here
+ * are exactly the ones the instruction will pass.
+ *
+ * Returns an empty list for SOL-only covenants, where the vault PDA holds
+ * lamports directly and no token account is involved.
+ */
+export async function settlementTokenAccountSetup(
+  payer: TransactionSigner,
+  covenant: Covenant,
+  accounts: SettlementAccounts,
+  mode: "swap" | "refund",
+): Promise<Instruction[]> {
+  const creator = unwrapOption(covenant.counterparty) ?? covenant.creator;
+  const counterparty = unwrapOption(covenant.counterparty);
+  const setups: Array<Promise<Instruction>> = [];
+
+  const add = (owner: Address, mint: Address) => {
+    if (isSol(AssetType.Token, mint)) return;
+    setups.push(buildCreateTokenAccount(payer, owner, mint));
+  };
+
+  // The vault's holding account for whichever side offered a token.
+  add(accounts.vault, covenant.creatorMint);
+  add(accounts.vault, covenant.counterpartyMint);
+
+  // Each side's payout destination. On a swap the creator receives the
+  // counterparty's mint and vice versa; a refund returns each side to itself.
+  if (counterparty) {
+    add(creator, mode === "swap" ? covenant.counterpartyMint : covenant.creatorMint);
+    add(counterparty, mode === "swap" ? covenant.creatorMint : covenant.counterpartyMint);
+  }
+
+  return Promise.all(setups);
 }
 
 /**
