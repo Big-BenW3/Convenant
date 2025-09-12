@@ -60,7 +60,6 @@ export type SwapOnL1Instruction<
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
   TAccountSystemProgram extends string | AccountMeta<string> =
     "11111111111111111111111111111111",
-  TAccountEscrow extends string | AccountMeta<string> = string,
   TRemainingAccounts extends readonly AccountMeta<string>[] = [],
 > = Instruction<TProgram> &
   InstructionWithData<ReadonlyUint8Array> &
@@ -105,9 +104,6 @@ export type SwapOnL1Instruction<
       TAccountSystemProgram extends string
         ? ReadonlyAccount<TAccountSystemProgram>
         : TAccountSystemProgram,
-      TAccountEscrow extends string
-        ? ReadonlyAccount<TAccountEscrow>
-        : TAccountEscrow,
       ...TRemainingAccounts,
     ]
   >;
@@ -153,12 +149,25 @@ export type SwapOnL1AsyncInput<
   TAccountCounterpartyMintAcct extends string = string,
   TAccountTokenProgram extends string = string,
   TAccountSystemProgram extends string = string,
-  TAccountEscrow extends string = string,
 > = {
   covenant: Address<TAccountCovenant>;
   vault?: Address<TAccountVault>;
+  /** counterparty's offer. */
   creator: Address<TAccountCreator>;
   counterparty: Address<TAccountCounterparty>;
+  /**
+   * program dispatches a scheduled action with this PDA as the authorising
+   * escrow authority (see `CallHandler::escrow_authority`), so the scheduled
+   * settlement always supplies the covenant key here.
+   *
+   * NOTE: this is deliberately *not* a `signer` constraint. The Magic
+   * program is the party that would co-sign at dispatch, but its exact
+   * dispatch semantics could not be verified offline; requiring a signature
+   * that the dispatcher does not actually provide would make settlement
+   * permanently uncallable. The settlement is instead authorised by
+   * `both_accepted` plus the recipient pinning below, which is what actually
+   * prevents value leaving the vault to an attacker-chosen account.
+   */
   escrowAuth: Address<TAccountEscrowAuth>;
   creatorVaultAta: Address<TAccountCreatorVaultAta>;
   counterpartyVaultAta: Address<TAccountCounterpartyVaultAta>;
@@ -168,7 +177,6 @@ export type SwapOnL1AsyncInput<
   counterpartyMintAcct: Address<TAccountCounterpartyMintAcct>;
   tokenProgram?: Address<TAccountTokenProgram>;
   systemProgram?: Address<TAccountSystemProgram>;
-  escrow: Address<TAccountEscrow>;
 };
 
 export async function getSwapOnL1InstructionAsync<
@@ -185,7 +193,6 @@ export async function getSwapOnL1InstructionAsync<
   TAccountCounterpartyMintAcct extends string,
   TAccountTokenProgram extends string,
   TAccountSystemProgram extends string,
-  TAccountEscrow extends string,
   TProgramAddress extends Address = typeof CONVENANT_PROGRAM_ADDRESS,
 >(
   input: SwapOnL1AsyncInput<
@@ -201,8 +208,7 @@ export async function getSwapOnL1InstructionAsync<
     TAccountCreatorMintAcct,
     TAccountCounterpartyMintAcct,
     TAccountTokenProgram,
-    TAccountSystemProgram,
-    TAccountEscrow
+    TAccountSystemProgram
   >,
   config?: { programAddress?: TProgramAddress },
 ): Promise<
@@ -220,8 +226,7 @@ export async function getSwapOnL1InstructionAsync<
     TAccountCreatorMintAcct,
     TAccountCounterpartyMintAcct,
     TAccountTokenProgram,
-    TAccountSystemProgram,
-    TAccountEscrow
+    TAccountSystemProgram
   >
 > {
   // Program address.
@@ -257,7 +262,6 @@ export async function getSwapOnL1InstructionAsync<
     },
     tokenProgram: { value: input.tokenProgram ?? null, isWritable: false },
     systemProgram: { value: input.systemProgram ?? null, isWritable: false },
-    escrow: { value: input.escrow ?? null, isWritable: false },
   };
   const accounts = originalAccounts as Record<
     keyof typeof originalAccounts,
@@ -295,7 +299,6 @@ export async function getSwapOnL1InstructionAsync<
       getAccountMeta(accounts.counterpartyMintAcct),
       getAccountMeta(accounts.tokenProgram),
       getAccountMeta(accounts.systemProgram),
-      getAccountMeta(accounts.escrow),
     ],
     data: getSwapOnL1InstructionDataEncoder().encode({}),
     programAddress,
@@ -313,8 +316,7 @@ export async function getSwapOnL1InstructionAsync<
     TAccountCreatorMintAcct,
     TAccountCounterpartyMintAcct,
     TAccountTokenProgram,
-    TAccountSystemProgram,
-    TAccountEscrow
+    TAccountSystemProgram
   >);
 }
 
@@ -332,12 +334,25 @@ export type SwapOnL1Input<
   TAccountCounterpartyMintAcct extends string = string,
   TAccountTokenProgram extends string = string,
   TAccountSystemProgram extends string = string,
-  TAccountEscrow extends string = string,
 > = {
   covenant: Address<TAccountCovenant>;
   vault: Address<TAccountVault>;
+  /** counterparty's offer. */
   creator: Address<TAccountCreator>;
   counterparty: Address<TAccountCounterparty>;
+  /**
+   * program dispatches a scheduled action with this PDA as the authorising
+   * escrow authority (see `CallHandler::escrow_authority`), so the scheduled
+   * settlement always supplies the covenant key here.
+   *
+   * NOTE: this is deliberately *not* a `signer` constraint. The Magic
+   * program is the party that would co-sign at dispatch, but its exact
+   * dispatch semantics could not be verified offline; requiring a signature
+   * that the dispatcher does not actually provide would make settlement
+   * permanently uncallable. The settlement is instead authorised by
+   * `both_accepted` plus the recipient pinning below, which is what actually
+   * prevents value leaving the vault to an attacker-chosen account.
+   */
   escrowAuth: Address<TAccountEscrowAuth>;
   creatorVaultAta: Address<TAccountCreatorVaultAta>;
   counterpartyVaultAta: Address<TAccountCounterpartyVaultAta>;
@@ -347,7 +362,6 @@ export type SwapOnL1Input<
   counterpartyMintAcct: Address<TAccountCounterpartyMintAcct>;
   tokenProgram?: Address<TAccountTokenProgram>;
   systemProgram?: Address<TAccountSystemProgram>;
-  escrow: Address<TAccountEscrow>;
 };
 
 export function getSwapOnL1Instruction<
@@ -364,7 +378,6 @@ export function getSwapOnL1Instruction<
   TAccountCounterpartyMintAcct extends string,
   TAccountTokenProgram extends string,
   TAccountSystemProgram extends string,
-  TAccountEscrow extends string,
   TProgramAddress extends Address = typeof CONVENANT_PROGRAM_ADDRESS,
 >(
   input: SwapOnL1Input<
@@ -380,8 +393,7 @@ export function getSwapOnL1Instruction<
     TAccountCreatorMintAcct,
     TAccountCounterpartyMintAcct,
     TAccountTokenProgram,
-    TAccountSystemProgram,
-    TAccountEscrow
+    TAccountSystemProgram
   >,
   config?: { programAddress?: TProgramAddress },
 ): SwapOnL1Instruction<
@@ -398,8 +410,7 @@ export function getSwapOnL1Instruction<
   TAccountCreatorMintAcct,
   TAccountCounterpartyMintAcct,
   TAccountTokenProgram,
-  TAccountSystemProgram,
-  TAccountEscrow
+  TAccountSystemProgram
 > {
   // Program address.
   const programAddress = config?.programAddress ?? CONVENANT_PROGRAM_ADDRESS;
@@ -434,7 +445,6 @@ export function getSwapOnL1Instruction<
     },
     tokenProgram: { value: input.tokenProgram ?? null, isWritable: false },
     systemProgram: { value: input.systemProgram ?? null, isWritable: false },
-    escrow: { value: input.escrow ?? null, isWritable: false },
   };
   const accounts = originalAccounts as Record<
     keyof typeof originalAccounts,
@@ -467,7 +477,6 @@ export function getSwapOnL1Instruction<
       getAccountMeta(accounts.counterpartyMintAcct),
       getAccountMeta(accounts.tokenProgram),
       getAccountMeta(accounts.systemProgram),
-      getAccountMeta(accounts.escrow),
     ],
     data: getSwapOnL1InstructionDataEncoder().encode({}),
     programAddress,
@@ -485,8 +494,7 @@ export function getSwapOnL1Instruction<
     TAccountCreatorMintAcct,
     TAccountCounterpartyMintAcct,
     TAccountTokenProgram,
-    TAccountSystemProgram,
-    TAccountEscrow
+    TAccountSystemProgram
   >);
 }
 
@@ -498,8 +506,22 @@ export type ParsedSwapOnL1Instruction<
   accounts: {
     covenant: TAccountMetas[0];
     vault: TAccountMetas[1];
+    /** counterparty's offer. */
     creator: TAccountMetas[2];
     counterparty: TAccountMetas[3];
+    /**
+     * program dispatches a scheduled action with this PDA as the authorising
+     * escrow authority (see `CallHandler::escrow_authority`), so the scheduled
+     * settlement always supplies the covenant key here.
+     *
+     * NOTE: this is deliberately *not* a `signer` constraint. The Magic
+     * program is the party that would co-sign at dispatch, but its exact
+     * dispatch semantics could not be verified offline; requiring a signature
+     * that the dispatcher does not actually provide would make settlement
+     * permanently uncallable. The settlement is instead authorised by
+     * `both_accepted` plus the recipient pinning below, which is what actually
+     * prevents value leaving the vault to an attacker-chosen account.
+     */
     escrowAuth: TAccountMetas[4];
     creatorVaultAta: TAccountMetas[5];
     counterpartyVaultAta: TAccountMetas[6];
@@ -509,7 +531,6 @@ export type ParsedSwapOnL1Instruction<
     counterpartyMintAcct: TAccountMetas[10];
     tokenProgram: TAccountMetas[11];
     systemProgram: TAccountMetas[12];
-    escrow: TAccountMetas[13];
   };
   data: SwapOnL1InstructionData;
 };
@@ -522,7 +543,7 @@ export function parseSwapOnL1Instruction<
     InstructionWithAccounts<TAccountMetas> &
     InstructionWithData<ReadonlyUint8Array>,
 ): ParsedSwapOnL1Instruction<TProgram, TAccountMetas> {
-  if (instruction.accounts.length < 14) {
+  if (instruction.accounts.length < 13) {
     // TODO: Coded error.
     throw new Error("Not enough accounts");
   }
@@ -548,7 +569,6 @@ export function parseSwapOnL1Instruction<
       counterpartyMintAcct: getNextAccount(),
       tokenProgram: getNextAccount(),
       systemProgram: getNextAccount(),
-      escrow: getNextAccount(),
     },
     data: getSwapOnL1InstructionDataDecoder().decode(instruction.data),
   };

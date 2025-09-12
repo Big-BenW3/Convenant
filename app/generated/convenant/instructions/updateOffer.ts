@@ -31,8 +31,13 @@ import {
   type WritableAccount,
   type WritableSignerAccount,
 } from "@solana/kit";
+import { findVaultPda } from "../pdas";
 import { CONVENANT_PROGRAM_ADDRESS } from "../programs";
-import { getAccountMetaFactory, type ResolvedAccount } from "../shared";
+import {
+  expectAddress,
+  getAccountMetaFactory,
+  type ResolvedAccount,
+} from "../shared";
 
 export const UPDATE_OFFER_DISCRIMINATOR = new Uint8Array([
   191, 70, 15, 66, 224, 2, 249, 223,
@@ -48,6 +53,7 @@ export type UpdateOfferInstruction<
   TProgram extends string = typeof CONVENANT_PROGRAM_ADDRESS,
   TAccountPayer extends string | AccountMeta<string> = string,
   TAccountCovenant extends string | AccountMeta<string> = string,
+  TAccountVault extends string | AccountMeta<string> = string,
   TRemainingAccounts extends readonly AccountMeta<string>[] = [],
 > = Instruction<TProgram> &
   InstructionWithData<ReadonlyUint8Array> &
@@ -60,6 +66,9 @@ export type UpdateOfferInstruction<
       TAccountCovenant extends string
         ? WritableAccount<TAccountCovenant>
         : TAccountCovenant,
+      TAccountVault extends string
+        ? WritableAccount<TAccountVault>
+        : TAccountVault,
       ...TRemainingAccounts,
     ]
   >;
@@ -98,23 +107,37 @@ export function getUpdateOfferInstructionDataCodec(): FixedSizeCodec<
   );
 }
 
-export type UpdateOfferInput<
+export type UpdateOfferAsyncInput<
   TAccountPayer extends string = string,
   TAccountCovenant extends string = string,
+  TAccountVault extends string = string,
 > = {
   payer: TransactionSigner<TAccountPayer>;
   covenant: Address<TAccountCovenant>;
+  /**
+   * The escrow vault, used to bound `update_offer` by the amount actually
+   * locked. Read-only here: no funds move during negotiation.
+   */
+  vault?: Address<TAccountVault>;
   newAmount: UpdateOfferInstructionDataArgs["newAmount"];
 };
 
-export function getUpdateOfferInstruction<
+export async function getUpdateOfferInstructionAsync<
   TAccountPayer extends string,
   TAccountCovenant extends string,
+  TAccountVault extends string,
   TProgramAddress extends Address = typeof CONVENANT_PROGRAM_ADDRESS,
 >(
-  input: UpdateOfferInput<TAccountPayer, TAccountCovenant>,
+  input: UpdateOfferAsyncInput<TAccountPayer, TAccountCovenant, TAccountVault>,
   config?: { programAddress?: TProgramAddress },
-): UpdateOfferInstruction<TProgramAddress, TAccountPayer, TAccountCovenant> {
+): Promise<
+  UpdateOfferInstruction<
+    TProgramAddress,
+    TAccountPayer,
+    TAccountCovenant,
+    TAccountVault
+  >
+> {
   // Program address.
   const programAddress = config?.programAddress ?? CONVENANT_PROGRAM_ADDRESS;
 
@@ -122,6 +145,79 @@ export function getUpdateOfferInstruction<
   const originalAccounts = {
     payer: { value: input.payer ?? null, isWritable: true },
     covenant: { value: input.covenant ?? null, isWritable: true },
+    vault: { value: input.vault ?? null, isWritable: true },
+  };
+  const accounts = originalAccounts as Record<
+    keyof typeof originalAccounts,
+    ResolvedAccount
+  >;
+
+  // Original args.
+  const args = { ...input };
+
+  // Resolve default values.
+  if (!accounts.vault.value) {
+    accounts.vault.value = await findVaultPda({
+      covenant: expectAddress(accounts.covenant.value),
+    });
+  }
+
+  const getAccountMeta = getAccountMetaFactory(programAddress, "programId");
+  return Object.freeze({
+    accounts: [
+      getAccountMeta(accounts.payer),
+      getAccountMeta(accounts.covenant),
+      getAccountMeta(accounts.vault),
+    ],
+    data: getUpdateOfferInstructionDataEncoder().encode(
+      args as UpdateOfferInstructionDataArgs,
+    ),
+    programAddress,
+  } as UpdateOfferInstruction<
+    TProgramAddress,
+    TAccountPayer,
+    TAccountCovenant,
+    TAccountVault
+  >);
+}
+
+export type UpdateOfferInput<
+  TAccountPayer extends string = string,
+  TAccountCovenant extends string = string,
+  TAccountVault extends string = string,
+> = {
+  payer: TransactionSigner<TAccountPayer>;
+  covenant: Address<TAccountCovenant>;
+  /**
+   * The escrow vault, used to bound `update_offer` by the amount actually
+   * locked. Read-only here: no funds move during negotiation.
+   */
+  vault: Address<TAccountVault>;
+  newAmount: UpdateOfferInstructionDataArgs["newAmount"];
+};
+
+export function getUpdateOfferInstruction<
+  TAccountPayer extends string,
+  TAccountCovenant extends string,
+  TAccountVault extends string,
+  TProgramAddress extends Address = typeof CONVENANT_PROGRAM_ADDRESS,
+>(
+  input: UpdateOfferInput<TAccountPayer, TAccountCovenant, TAccountVault>,
+  config?: { programAddress?: TProgramAddress },
+): UpdateOfferInstruction<
+  TProgramAddress,
+  TAccountPayer,
+  TAccountCovenant,
+  TAccountVault
+> {
+  // Program address.
+  const programAddress = config?.programAddress ?? CONVENANT_PROGRAM_ADDRESS;
+
+  // Original accounts.
+  const originalAccounts = {
+    payer: { value: input.payer ?? null, isWritable: true },
+    covenant: { value: input.covenant ?? null, isWritable: true },
+    vault: { value: input.vault ?? null, isWritable: true },
   };
   const accounts = originalAccounts as Record<
     keyof typeof originalAccounts,
@@ -136,6 +232,7 @@ export function getUpdateOfferInstruction<
     accounts: [
       getAccountMeta(accounts.payer),
       getAccountMeta(accounts.covenant),
+      getAccountMeta(accounts.vault),
     ],
     data: getUpdateOfferInstructionDataEncoder().encode(
       args as UpdateOfferInstructionDataArgs,
@@ -144,7 +241,8 @@ export function getUpdateOfferInstruction<
   } as UpdateOfferInstruction<
     TProgramAddress,
     TAccountPayer,
-    TAccountCovenant
+    TAccountCovenant,
+    TAccountVault
   >);
 }
 
@@ -156,6 +254,11 @@ export type ParsedUpdateOfferInstruction<
   accounts: {
     payer: TAccountMetas[0];
     covenant: TAccountMetas[1];
+    /**
+     * The escrow vault, used to bound `update_offer` by the amount actually
+     * locked. Read-only here: no funds move during negotiation.
+     */
+    vault: TAccountMetas[2];
   };
   data: UpdateOfferInstructionData;
 };
@@ -168,7 +271,7 @@ export function parseUpdateOfferInstruction<
     InstructionWithAccounts<TAccountMetas> &
     InstructionWithData<ReadonlyUint8Array>,
 ): ParsedUpdateOfferInstruction<TProgram, TAccountMetas> {
-  if (instruction.accounts.length < 2) {
+  if (instruction.accounts.length < 3) {
     // TODO: Coded error.
     throw new Error("Not enough accounts");
   }
@@ -180,7 +283,11 @@ export function parseUpdateOfferInstruction<
   };
   return {
     programAddress: instruction.programAddress,
-    accounts: { payer: getNextAccount(), covenant: getNextAccount() },
+    accounts: {
+      payer: getNextAccount(),
+      covenant: getNextAccount(),
+      vault: getNextAccount(),
+    },
     data: getUpdateOfferInstructionDataDecoder().decode(instruction.data),
   };
 }

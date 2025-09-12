@@ -173,6 +173,10 @@ export type CommitAndSwapAsyncInput<
   payer: TransactionSigner<TAccountPayer>;
   covenant: Address<TAccountCovenant>;
   vault?: Address<TAccountVault>;
+  /**
+   * counterparty's offer. Constrained so the scheduled action cannot be
+   * pointed at an attacker-chosen payout.
+   */
   creator: Address<TAccountCreator>;
   counterparty: Address<TAccountCounterparty>;
   creatorVaultAta: Address<TAccountCreatorVaultAta>;
@@ -368,6 +372,10 @@ export type CommitAndSwapInput<
   payer: TransactionSigner<TAccountPayer>;
   covenant: Address<TAccountCovenant>;
   vault: Address<TAccountVault>;
+  /**
+   * counterparty's offer. Constrained so the scheduled action cannot be
+   * pointed at an attacker-chosen payout.
+   */
   creator: Address<TAccountCreator>;
   counterparty: Address<TAccountCounterparty>;
   creatorVaultAta: Address<TAccountCreatorVaultAta>;
@@ -545,6 +553,10 @@ export type ParsedCommitAndSwapInstruction<
     payer: TAccountMetas[0];
     covenant: TAccountMetas[1];
     vault: TAccountMetas[2];
+    /**
+     * counterparty's offer. Constrained so the scheduled action cannot be
+     * pointed at an attacker-chosen payout.
+     */
     creator: TAccountMetas[3];
     counterparty: TAccountMetas[4];
     creatorVaultAta: TAccountMetas[5];

@@ -58,13 +58,25 @@ export const CONVENANT_ERROR__INVALID_PERMISSION_PDA = 0x1783; // 6019
 export const CONVENANT_ERROR__INVALID_MINT = 0x1784; // 6020
 /** InvalidTokenProgram: The provided token program is invalid */
 export const CONVENANT_ERROR__INVALID_TOKEN_PROGRAM = 0x1785; // 6021
+/** CovenantPdaMismatch: The provided covenant PDA does not match the covenant seeds */
+export const CONVENANT_ERROR__COVENANT_PDA_MISMATCH = 0x1786; // 6022
+/** CreatorMismatch: The provided creator account does not match the covenant */
+export const CONVENANT_ERROR__CREATOR_MISMATCH = 0x1787; // 6023
+/** CounterpartyMismatch: The provided counterparty account does not match the covenant */
+export const CONVENANT_ERROR__COUNTERPARTY_MISMATCH = 0x1788; // 6024
+/** EscrowAuthorityMismatch: The provided escrow authority is not the covenant PDA */
+export const CONVENANT_ERROR__ESCROW_AUTHORITY_MISMATCH = 0x1789; // 6025
 
 export type ConvenantError =
   | typeof CONVENANT_ERROR__ALREADY_SETTLED
   | typeof CONVENANT_ERROR__COUNTERPARTY_ALREADY_JOINED
+  | typeof CONVENANT_ERROR__COUNTERPARTY_MISMATCH
   | typeof CONVENANT_ERROR__COUNTERPARTY_NOT_JOINED
+  | typeof CONVENANT_ERROR__COVENANT_PDA_MISMATCH
+  | typeof CONVENANT_ERROR__CREATOR_MISMATCH
   | typeof CONVENANT_ERROR__DEADLINE_IN_PAST
   | typeof CONVENANT_ERROR__DEADLINE_NOT_PASSED
+  | typeof CONVENANT_ERROR__ESCROW_AUTHORITY_MISMATCH
   | typeof CONVENANT_ERROR__FROZEN_AFTER_ACCEPT
   | typeof CONVENANT_ERROR__INSUFFICIENT_FUNDS
   | typeof CONVENANT_ERROR__INVALID_COUNTERPARTY
@@ -88,9 +100,13 @@ if (process.env.NODE_ENV !== "production") {
   convenantErrorMessages = {
     [CONVENANT_ERROR__ALREADY_SETTLED]: `Covenant already settled`,
     [CONVENANT_ERROR__COUNTERPARTY_ALREADY_JOINED]: `The counterparty has already joined`,
+    [CONVENANT_ERROR__COUNTERPARTY_MISMATCH]: `The provided counterparty account does not match the covenant`,
     [CONVENANT_ERROR__COUNTERPARTY_NOT_JOINED]: `The counterparty has not joined yet`,
+    [CONVENANT_ERROR__COVENANT_PDA_MISMATCH]: `The provided covenant PDA does not match the covenant seeds`,
+    [CONVENANT_ERROR__CREATOR_MISMATCH]: `The provided creator account does not match the covenant`,
     [CONVENANT_ERROR__DEADLINE_IN_PAST]: `Deadline must be in the future`,
     [CONVENANT_ERROR__DEADLINE_NOT_PASSED]: `Deadline has not passed yet`,
+    [CONVENANT_ERROR__ESCROW_AUTHORITY_MISMATCH]: `The provided escrow authority is not the covenant PDA`,
     [CONVENANT_ERROR__FROZEN_AFTER_ACCEPT]: `Supply cannot be altered after acceptance`,
     [CONVENANT_ERROR__INSUFFICIENT_FUNDS]: `Insufficient funds for this asset`,
     [CONVENANT_ERROR__INVALID_COUNTERPARTY]: `Counterparty cannot be the system program`,

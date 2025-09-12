@@ -161,6 +161,10 @@ export type ExpireAndRefundAsyncInput<
   signer: TransactionSigner<TAccountSigner>;
   covenant: Address<TAccountCovenant>;
   vault?: Address<TAccountVault>;
+  /**
+   * recipients are pinned so the vault PDA can never be instructed to pay a
+   * caller-chosen account.
+   */
   creator: Address<TAccountCreator>;
   counterparty: Address<TAccountCounterparty>;
   creatorVaultAta: Address<TAccountCreatorVaultAta>;
@@ -332,6 +336,10 @@ export type ExpireAndRefundInput<
   signer: TransactionSigner<TAccountSigner>;
   covenant: Address<TAccountCovenant>;
   vault: Address<TAccountVault>;
+  /**
+   * recipients are pinned so the vault PDA can never be instructed to pay a
+   * caller-chosen account.
+   */
   creator: Address<TAccountCreator>;
   counterparty: Address<TAccountCounterparty>;
   creatorVaultAta: Address<TAccountCreatorVaultAta>;
@@ -487,6 +495,10 @@ export type ParsedExpireAndRefundInstruction<
     signer: TAccountMetas[0];
     covenant: TAccountMetas[1];
     vault: TAccountMetas[2];
+    /**
+     * recipients are pinned so the vault PDA can never be instructed to pay a
+     * caller-chosen account.
+     */
     creator: TAccountMetas[3];
     counterparty: TAccountMetas[4];
     creatorVaultAta: TAccountMetas[5];

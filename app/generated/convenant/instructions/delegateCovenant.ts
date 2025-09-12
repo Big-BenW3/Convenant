@@ -149,6 +149,10 @@ export type DelegateCovenantAsyncInput<
   bufferCovenant?: Address<TAccountBufferCovenant>;
   delegationRecordCovenant?: Address<TAccountDelegationRecordCovenant>;
   delegationMetadataCovenant?: Address<TAccountDelegationMetadataCovenant>;
+  /**
+   * `UncheckedAccount` + `del` — canonical PER pattern; the PDA seeds are
+   * re-asserted in the handler before the SDK delegation runs.
+   */
   covenant: Address<TAccountCovenant>;
   validator?: Address<TAccountValidator>;
   ownerProgram?: Address<TAccountOwnerProgram>;
@@ -300,6 +304,10 @@ export type DelegateCovenantInput<
   bufferCovenant: Address<TAccountBufferCovenant>;
   delegationRecordCovenant: Address<TAccountDelegationRecordCovenant>;
   delegationMetadataCovenant: Address<TAccountDelegationMetadataCovenant>;
+  /**
+   * `UncheckedAccount` + `del` — canonical PER pattern; the PDA seeds are
+   * re-asserted in the handler before the SDK delegation runs.
+   */
   covenant: Address<TAccountCovenant>;
   validator?: Address<TAccountValidator>;
   ownerProgram?: Address<TAccountOwnerProgram>;
@@ -425,6 +433,10 @@ export type ParsedDelegateCovenantInstruction<
     bufferCovenant: TAccountMetas[1];
     delegationRecordCovenant: TAccountMetas[2];
     delegationMetadataCovenant: TAccountMetas[3];
+    /**
+     * `UncheckedAccount` + `del` — canonical PER pattern; the PDA seeds are
+     * re-asserted in the handler before the SDK delegation runs.
+     */
     covenant: TAccountMetas[4];
     validator?: TAccountMetas[5] | undefined;
     ownerProgram: TAccountMetas[6];

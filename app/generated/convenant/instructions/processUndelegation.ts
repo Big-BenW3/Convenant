@@ -12,10 +12,12 @@ import {
   combineCodec,
   fixDecoderSize,
   fixEncoderSize,
+  getAddressEncoder,
   getArrayDecoder,
   getArrayEncoder,
   getBytesDecoder,
   getBytesEncoder,
+  getProgramDerivedAddress,
   getStructDecoder,
   getStructEncoder,
   getU32Decoder,
@@ -34,7 +36,11 @@ import {
   type WritableAccount,
 } from "@solana/kit";
 import { CONVENANT_PROGRAM_ADDRESS } from "../programs";
-import { getAccountMetaFactory, type ResolvedAccount } from "../shared";
+import {
+  expectAddress,
+  getAccountMetaFactory,
+  type ResolvedAccount,
+} from "../shared";
 
 export const PROCESS_UNDELEGATION_DISCRIMINATOR = new Uint8Array([
   196, 28, 41, 206, 48, 37, 51, 167,
@@ -119,6 +125,102 @@ export function getProcessUndelegationInstructionDataCodec(): Codec<
     getProcessUndelegationInstructionDataEncoder(),
     getProcessUndelegationInstructionDataDecoder(),
   );
+}
+
+export type ProcessUndelegationAsyncInput<
+  TAccountBaseAccount extends string = string,
+  TAccountBuffer extends string = string,
+  TAccountPayer extends string = string,
+  TAccountSystemProgram extends string = string,
+> = {
+  baseAccount: Address<TAccountBaseAccount>;
+  buffer?: Address<TAccountBuffer>;
+  payer: Address<TAccountPayer>;
+  systemProgram?: Address<TAccountSystemProgram>;
+  accountSeeds: ProcessUndelegationInstructionDataArgs["accountSeeds"];
+};
+
+export async function getProcessUndelegationInstructionAsync<
+  TAccountBaseAccount extends string,
+  TAccountBuffer extends string,
+  TAccountPayer extends string,
+  TAccountSystemProgram extends string,
+  TProgramAddress extends Address = typeof CONVENANT_PROGRAM_ADDRESS,
+>(
+  input: ProcessUndelegationAsyncInput<
+    TAccountBaseAccount,
+    TAccountBuffer,
+    TAccountPayer,
+    TAccountSystemProgram
+  >,
+  config?: { programAddress?: TProgramAddress },
+): Promise<
+  ProcessUndelegationInstruction<
+    TProgramAddress,
+    TAccountBaseAccount,
+    TAccountBuffer,
+    TAccountPayer,
+    TAccountSystemProgram
+  >
+> {
+  // Program address.
+  const programAddress = config?.programAddress ?? CONVENANT_PROGRAM_ADDRESS;
+
+  // Original accounts.
+  const originalAccounts = {
+    baseAccount: { value: input.baseAccount ?? null, isWritable: true },
+    buffer: { value: input.buffer ?? null, isWritable: false },
+    payer: { value: input.payer ?? null, isWritable: true },
+    systemProgram: { value: input.systemProgram ?? null, isWritable: false },
+  };
+  const accounts = originalAccounts as Record<
+    keyof typeof originalAccounts,
+    ResolvedAccount
+  >;
+
+  // Original args.
+  const args = { ...input };
+
+  // Resolve default values.
+  if (!accounts.buffer.value) {
+    accounts.buffer.value = await getProgramDerivedAddress({
+      programAddress:
+        "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh" as Address<"DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh">,
+      seeds: [
+        getBytesEncoder().encode(
+          new Uint8Array([
+            117, 110, 100, 101, 108, 101, 103, 97, 116, 101, 45, 98, 117, 102,
+            102, 101, 114,
+          ]),
+        ),
+        getAddressEncoder().encode(expectAddress(accounts.baseAccount.value)),
+      ],
+    });
+  }
+  if (!accounts.systemProgram.value) {
+    accounts.systemProgram.value =
+      "11111111111111111111111111111111" as Address<"11111111111111111111111111111111">;
+  }
+
+  const getAccountMeta = getAccountMetaFactory(programAddress, "programId");
+  return Object.freeze({
+    accounts: [
+      getAccountMeta(accounts.baseAccount),
+      getAccountMeta(accounts.buffer),
+      getAccountMeta(accounts.payer),
+      getAccountMeta(accounts.systemProgram),
+    ],
+    data: getProcessUndelegationInstructionDataEncoder().encode(
+      args as ProcessUndelegationInstructionDataArgs,
+    ),
+    programAddress,
+  } as ProcessUndelegationInstruction<
+    TProgramAddress,
+    TAccountBaseAccount,
+    TAccountBuffer,
+    TAccountPayer,
+    TAccountSystemProgram
+  >);
 }
 
 export type ProcessUndelegationInput<
