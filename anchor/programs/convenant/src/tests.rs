@@ -42,6 +42,8 @@ const DISC_SWAP_ON_L1: [u8; 8] = [207, 160, 90, 203, 40, 73, 204, 51];
 const DISC_EXPIRE_AND_REFUND: [u8; 8] = [129, 130, 91, 224, 222, 230, 183, 134];
 const DISC_CANCEL_COVENANT: [u8; 8] = [245, 55, 132, 8, 37, 126, 233, 151];
 const DISC_CLOSE_COVENANT: [u8; 8] = [117, 43, 73, 49, 177, 109, 215, 195];
+const DISC_UPDATE_OFFER: [u8; 8] = [191, 70, 15, 66, 224, 2, 249, 223];
+const DISC_ACCEPT: [u8; 8] = [65, 150, 70, 216, 133, 6, 107, 4];
 
 fn covenant_pda(creator: &Pubkey, nonce: u64) -> (Pubkey, u8) {
     Pubkey::find_program_address(
@@ -393,6 +395,24 @@ fn close_ix(signer: &Pubkey, covenant: &Pubkey) -> Instruction {
             AccountMeta::new_readonly(system_program::ID, false),
         ],
         data: DISC_CLOSE_COVENANT.to_vec(),
+    }
+}
+
+/// `update_offer` / `accept` share the `Negotiate` context: payer (signer),
+/// covenant, vault.
+fn negotiate_ix(payer: &Pubkey, covenant: &Pubkey, vault: &Pubkey, disc: [u8; 8], amount: Option<u64>) -> Instruction {
+    let mut data = disc.to_vec();
+    if let Some(a) = amount {
+        data.extend_from_slice(&a.to_le_bytes());
+    }
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(*covenant, false),
+            AccountMeta::new(*vault, false),
+        ],
+        data,
     }
 }
 
@@ -1159,4 +1179,673 @@ fn test_invite_only_join_rejects_wrong_party() {
         &system_program::ID,
     );
     assert_tx_ok(&mut svm, &invited, &[join_ok]);
+}
+
+// ---------------------------------------------------------------------
+// Security regression tests
+//
+// Every test here covers a property that was previously unenforced. They are
+// deliberately negative: each asserts that a specific abuse is REJECTED and
+// that the vault is left intact afterwards.
+// ---------------------------------------------------------------------
+
+/// Anchor user error codes (offset 6000), matching the declaration order in
+/// `errors.rs`. Kept as named constants so a reorder surfaces as a test failure
+/// rather than a silently wrong assertion.
+const ERR_UNAUTHORIZED_SIGNER: u32 = 6000;
+const ERR_DEADLINE_IN_PAST: u32 = 6002;
+const ERR_ZERO_AMOUNT: u32 = 6003;
+const ERR_COUNTERPARTY_NOT_JOINED: u32 = 6006;
+const ERR_NOT_BOTH_ACCEPTED: u32 = 6008;
+const ERR_DEADLINE_NOT_PASSED: u32 = 6009;
+const ERR_INSUFFICIENT_FUNDS: u32 = 6010;
+const ERR_FROZEN_AFTER_ACCEPT: u32 = 6018;
+const ERR_CREATOR_MISMATCH: u32 = 6023;
+const ERR_COUNTERPARTY_MISMATCH: u32 = 6024;
+const ERR_ESCROW_AUTHORITY_MISMATCH: u32 = 6025;
+
+/// LiteSVM charges 5000 lamports per transaction by default. Assertions on
+/// actor balances subtract this when the actor is also the fee payer.
+const TX_FEE: u64 = 5000;
+
+/// Send a transaction that must fail with the given Anchor user error code.
+/// Asserting on the exact code (not merely `is_err`) is what makes these
+/// regression tests meaningful: a failure for the wrong reason would pass a
+/// weaker assertion.
+fn assert_tx_err(svm: &mut LiteSVM, payer: &Keypair, ixs: &[Instruction], expected: u32) {
+    let blockhash = svm.latest_blockhash();
+    let tx = Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &[payer], blockhash);
+    match svm.send_transaction(tx) {
+        Ok(_) => panic!("expected transaction to fail with error {expected}, but it succeeded"),
+        Err(e) => {
+            let rendered = format!("{e:?}");
+            let needle = format!("Custom({expected})");
+            assert!(
+                rendered.contains(&needle),
+                "expected error {expected} ({needle}), got: {rendered}"
+            );
+        }
+    }
+}
+
+/// Builds and funds a creator + counterparty, runs `initialize_covenant` and
+/// `join_covenant` for a plain SOL<->SOL covenant, and returns the context plus
+/// the locked balances.
+///
+/// `deadline_offset` is always positive here — `initialize_covenant` rejects a
+/// deadline in the past. Tests that need an already-expired covenant call
+/// `advance_clock_past_deadline` afterwards.
+struct SolCovenant {
+    svm: LiteSVM,
+    creator: Keypair,
+    counterparty: Keypair,
+    covenant: Pubkey,
+    vault: Pubkey,
+    creator_lock: u64,
+    cp_lock: u64,
+    deadline: i64,
+}
+
+fn setup_sol_covenant(deadline_offset: i64) -> SolCovenant {
+    let mut svm = setup_program();
+    let creator = Keypair::new();
+    let counterparty = Keypair::new();
+    svm.airdrop(&creator.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+    svm.airdrop(&counterparty.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+
+    let creator_lock = 2 * LAMPORTS_PER_SOL;
+    let cp_lock = 1 * LAMPORTS_PER_SOL;
+    let (covenant, _) = covenant_pda(&creator.pubkey(), 0);
+    let (vault, _) = vault_pda(&covenant);
+
+    let deadline = current_ts(&svm) + deadline_offset;
+    let init = initialize_ix(
+        &creator.pubkey(),
+        Some(&counterparty.pubkey()),
+        AssetType::Sol,
+        &system_program::ID,
+        creator_lock,
+        deadline,
+        0,
+        &covenant,
+        &vault,
+        &vault,
+        &vault,
+        &system_program::ID,
+    );
+    assert_tx_ok(&mut svm, &creator, &[init]);
+
+    let join = join_ix(
+        &counterparty.pubkey(),
+        AssetType::Sol,
+        &system_program::ID,
+        cp_lock,
+        &covenant,
+        &vault,
+        &vault,
+        &vault,
+        &system_program::ID,
+    );
+    assert_tx_ok(&mut svm, &counterparty, &[join]);
+
+    assert_eq!(
+        svm.get_account(&vault).unwrap().lamports,
+        creator_lock + cp_lock,
+        "vault should hold both locked amounts"
+    );
+
+    SolCovenant {
+        svm,
+        creator,
+        counterparty,
+        covenant,
+        vault,
+        creator_lock,
+        cp_lock,
+        deadline,
+    }
+}
+
+/// Move LiteSVM's clock past the covenant deadline so `expire_and_refund`
+/// becomes reachable. LiteSVM's clock lives in the Clock sysvar account.
+fn advance_clock_past_deadline(svm: &mut LiteSVM, deadline: i64) {
+    let mut acct = svm.get_account(&CLOCK_ID).unwrap();
+    // unix_ts is at byte offset 32 within the Clock account data.
+    acct.data[32..40].copy_from_slice(&(deadline + 10).to_le_bytes());
+    svm.set_account(CLOCK_ID, acct).unwrap();
+}
+
+/// Balance delta helper so refund assertions are exact rather than `>=`.
+fn delta(before: u64, after: u64) -> i128 {
+    after as i128 - before as i128
+}
+
+/// The original fund-theft bug: `expire_and_refund` declared its recipients as
+/// unconstrained `UncheckedAccount`s, so the counterparty could name an
+/// attacker-controlled `creator` and have the vault PDA sign the creator's
+/// locked SOL over to them.
+#[test]
+fn test_expire_rejects_attacker_controlled_creator_recipient() {
+    let mut c = setup_sol_covenant(60);
+    advance_clock_past_deadline(&mut c.svm, c.deadline);
+    let mut svm = c.svm;
+    let attacker = Keypair::new();
+    svm.airdrop(&attacker.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+
+    let attacker_before = svm.get_balance(&attacker.pubkey()).unwrap();
+
+    // Counterparty signs (passes the party check) but redirects the creator's
+    // refund to the attacker.
+    let ix = expire_ix(
+        &c.counterparty.pubkey(),
+        &c.covenant,
+        &c.vault,
+        &attacker.pubkey(), // <- forged creator
+        &c.counterparty.pubkey(),
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &system_program::ID,
+        &system_program::ID,
+    );
+    assert_tx_err(&mut svm, &c.counterparty, &[ix], ERR_CREATOR_MISMATCH);
+
+    // Nothing moved: the attacker's balance is unchanged and the vault is intact.
+    // The counterparty signed, so its only movement is the transaction fee.
+    // The attacker never appears in the transaction at all.
+    let attacker_after = svm.get_balance(&attacker.pubkey()).unwrap();
+    assert_eq!(
+        delta(attacker_before, attacker_after),
+        0,
+        "attacker must not receive any funds from a forged refund"
+    );
+    assert_eq!(
+        svm.get_account(&c.vault).unwrap().lamports,
+        c.creator_lock + c.cp_lock,
+        "vault must be untouched after a rejected forged refund"
+    );
+}
+
+/// Mirror of the above for `cancel_covenant`: the creator could previously name
+/// an arbitrary `counterparty` and take the counterparty's locked SOL.
+#[test]
+fn test_cancel_rejects_attacker_controlled_counterparty_recipient() {
+    let c = setup_sol_covenant(1000);
+    let mut svm = c.svm;
+    let attacker = Keypair::new();
+    svm.airdrop(&attacker.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+
+    let attacker_before = svm.get_balance(&attacker.pubkey()).unwrap();
+
+    let ix = cancel_ix(
+        &c.creator.pubkey(),
+        &c.covenant,
+        &c.vault,
+        &c.creator.pubkey(),
+        &attacker.pubkey(), // <- forged counterparty
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &system_program::ID,
+        &system_program::ID,
+    );
+    assert_tx_err(&mut svm, &c.creator, &[ix], ERR_COUNTERPARTY_MISMATCH);
+
+    let attacker_after = svm.get_balance(&attacker.pubkey()).unwrap();
+    assert_eq!(
+        delta(attacker_before, attacker_after),
+        0,
+        "attacker must not receive the counterparty's locked funds"
+    );
+    assert_eq!(
+        svm.get_account(&c.vault).unwrap().lamports,
+        c.creator_lock + c.cp_lock,
+        "vault must be untouched after a rejected forged cancel"
+    );
+}
+
+/// `swap_on_l1` must not settle to caller-chosen accounts. Because both
+/// recipients were unconstrained, anyone could drain the entire vault into two
+/// wallets they control.
+#[test]
+fn test_swap_rejects_attacker_controlled_recipients() {
+    let c = setup_sol_covenant(1000);
+    let mut svm = c.svm;
+    let attacker_a = Keypair::new();
+    let attacker_b = Keypair::new();
+    svm.airdrop(&attacker_a.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+    svm.airdrop(&attacker_b.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+
+    let a_before = svm.get_balance(&attacker_a.pubkey()).unwrap();
+    let b_before = svm.get_balance(&attacker_b.pubkey()).unwrap();
+
+    activate_covenant(&mut svm, &c.covenant);
+
+    // Forged creator recipient.
+    let ix = swap_ix(
+        &c.covenant,
+        &c.vault,
+        &attacker_a.pubkey(), // <- forged creator
+        &attacker_b.pubkey(), // <- forged counterparty
+        &c.covenant,
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &system_program::ID,
+        &system_program::ID,
+        &system_program::ID,
+    );
+    assert_tx_err(&mut svm, &attacker_a, &[ix], ERR_CREATOR_MISMATCH);
+
+    // attacker_a signed (it is the declared payer), so it loses only the fee.
+    // attacker_b is never referenced by the transaction.
+    assert_eq!(
+        delta(a_before, svm.get_balance(&attacker_a.pubkey()).unwrap()),
+        -(TX_FEE as i128),
+        "the signing attacker must gain nothing but a fee charge"
+    );
+    assert_eq!(
+        delta(b_before, svm.get_balance(&attacker_b.pubkey()).unwrap()),
+        0,
+        "the second attacker must gain nothing"
+    );
+    assert_eq!(
+        svm.get_account(&c.vault).unwrap().lamports,
+        c.creator_lock + c.cp_lock,
+        "vault must be untouched when settlement targets forged recipients"
+    );
+}
+
+/// The escrow authority must be the covenant PDA. Passing an arbitrary key used
+/// to satisfy nothing beyond a key comparison the attacker could reproduce.
+#[test]
+fn test_swap_rejects_wrong_escrow_authority() {
+    let c = setup_sol_covenant(1000);
+    let mut svm = c.svm;
+    let impostor = Keypair::new();
+    svm.airdrop(&impostor.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+
+    activate_covenant(&mut svm, &c.covenant);
+
+    let ix = swap_ix(
+        &c.covenant,
+        &c.vault,
+        &c.creator.pubkey(),
+        &c.counterparty.pubkey(),
+        &impostor.pubkey(), // <- not the covenant PDA
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &system_program::ID,
+        &system_program::ID,
+        &system_program::ID,
+    );
+    assert_tx_err(&mut svm, &impostor, &[ix], ERR_ESCROW_AUTHORITY_MISMATCH);
+
+    assert_eq!(
+        svm.get_account(&c.vault).unwrap().lamports,
+        c.creator_lock + c.cp_lock,
+        "vault must be untouched when the escrow authority is wrong"
+    );
+}
+
+/// A counterparty must not be able to refund before the deadline.
+#[test]
+fn test_expire_rejected_before_deadline() {
+    let c = setup_sol_covenant(1000); // deadline in the future
+    let mut svm = c.svm;
+
+    let ix = expire_ix(
+        &c.counterparty.pubkey(),
+        &c.covenant,
+        &c.vault,
+        &c.creator.pubkey(),
+        &c.counterparty.pubkey(),
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &system_program::ID,
+        &system_program::ID,
+    );
+    assert_tx_err(&mut svm, &c.counterparty, &[ix], ERR_DEADLINE_NOT_PASSED);
+    assert_eq!(
+        svm.get_account(&c.vault).unwrap().lamports,
+        c.creator_lock + c.cp_lock
+    );
+}
+
+/// Only the two recorded parties may trigger a refund.
+#[test]
+fn test_expire_rejects_third_party() {
+    let mut c = setup_sol_covenant(60);
+    advance_clock_past_deadline(&mut c.svm, c.deadline);
+    let mut svm = c.svm;
+    let stranger = Keypair::new();
+    svm.airdrop(&stranger.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+
+    let ix = expire_ix(
+        &stranger.pubkey(),
+        &c.covenant,
+        &c.vault,
+        &c.creator.pubkey(),
+        &c.counterparty.pubkey(),
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &system_program::ID,
+        &system_program::ID,
+    );
+    assert_tx_err(&mut svm, &stranger, &[ix], ERR_UNAUTHORIZED_SIGNER);
+    assert_eq!(
+        svm.get_account(&c.vault).unwrap().lamports,
+        c.creator_lock + c.cp_lock
+    );
+}
+
+/// Only the creator may cancel.
+#[test]
+fn test_cancel_rejects_non_creator() {
+    let c = setup_sol_covenant(1000);
+    let mut svm = c.svm;
+
+    let ix = cancel_ix(
+        &c.counterparty.pubkey(),
+        &c.covenant,
+        &c.vault,
+        &c.creator.pubkey(),
+        &c.counterparty.pubkey(),
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &system_program::ID,
+        &system_program::ID,
+    );
+    assert_tx_err(&mut svm, &c.counterparty, &[ix], ERR_UNAUTHORIZED_SIGNER);
+    assert_eq!(
+        svm.get_account(&c.vault).unwrap().lamports,
+        c.creator_lock + c.cp_lock
+    );
+}
+
+/// `join_covenant` must be rejected once the deadline has passed.
+#[test]
+fn test_join_rejected_after_deadline() {
+    let c = setup_sol_covenant(1000);
+    let mut svm = c.svm;
+    let latecomer = Keypair::new();
+    svm.airdrop(&latecomer.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+
+    let (covenant2, _) = covenant_pda(&c.creator.pubkey(), 7);
+    let (vault2, _) = vault_pda(&covenant2);
+    let init = initialize_ix(
+        &c.creator.pubkey(),
+        Some(&latecomer.pubkey()),
+        AssetType::Sol,
+        &system_program::ID,
+        1 * LAMPORTS_PER_SOL,
+        current_ts(&svm) - 1, // already expired
+        7,
+        &covenant2,
+        &vault2,
+        &vault2,
+        &vault2,
+        &system_program::ID,
+    );
+    // initialize itself must reject a past deadline.
+    assert_tx_err(&mut svm, &c.creator, &[init], ERR_DEADLINE_IN_PAST);
+}
+
+/// Flip the covenant to `ActiveOnEr` while leaving both acceptance flags
+/// false, which is the state the ER actually presents once a covenant is
+/// delegated but nobody has accepted yet. Use this when a test needs
+/// `update_offer` to reach its amount checks rather than short-circuiting on
+/// `FrozenAfterAccept`.
+fn set_active_er_unaccepted(svm: &mut LiteSVM, covenant: &Pubkey) {
+    let mut acct = svm.get_account(covenant).unwrap();
+    acct.data[191] = 2; // CovenantStatus::ActiveOnEr
+    svm.set_account(*covenant, acct).unwrap();
+}
+
+/// A party must not be able to re-price its offer beyond what the vault holds.
+/// Previously `update_offer` accepted any amount, so a party could negotiate an
+/// offer larger than its own deposit and the vault could not cover settlement.
+#[test]
+fn test_update_offer_rejects_amount_above_vault_balance() {
+    let c = setup_sol_covenant(1000);
+    let mut svm = c.svm;
+
+    set_active_er_unaccepted(&mut svm, &c.covenant);
+
+    let vault_lamports = svm.get_account(&c.vault).unwrap().lamports;
+    let too_much = vault_lamports + 1;
+
+    let ix = negotiate_ix(
+        &c.counterparty.pubkey(),
+        &c.covenant,
+        &c.vault,
+        DISC_UPDATE_OFFER,
+        Some(too_much),
+    );
+    assert_tx_err(&mut svm, &c.counterparty, &[ix], ERR_INSUFFICIENT_FUNDS);
+
+    // Terms unchanged: the escrow still holds the original amounts.
+    assert_eq!(
+        svm.get_account(&c.vault).unwrap().lamports,
+        c.creator_lock + c.cp_lock,
+        "a rejected re-price must not move funds"
+    );
+}
+
+/// Zero is rejected — and the handler must validate *before* writing, so a
+/// failed update leaves the committed amount untouched.
+#[test]
+fn test_update_offer_rejects_zero_amount() {
+    let c = setup_sol_covenant(1000);
+    let mut svm = c.svm;
+
+    set_active_er_unaccepted(&mut svm, &c.covenant);
+
+    let ix = negotiate_ix(
+        &c.counterparty.pubkey(),
+        &c.covenant,
+        &c.vault,
+        DISC_UPDATE_OFFER,
+        Some(0),
+    );
+    assert_tx_err(&mut svm, &c.counterparty, &[ix], ERR_ZERO_AMOUNT);
+}
+
+/// Once a party has accepted, it cannot silently re-price its own offer.
+#[test]
+fn test_update_offer_rejected_after_accept() {
+    let c = setup_sol_covenant(1000);
+    let mut svm = c.svm;
+
+    activate_covenant(&mut svm, &c.covenant);
+
+    // counterparty accepts, then tries to move its offer.
+    let accept = negotiate_ix(
+        &c.counterparty.pubkey(),
+        &c.covenant,
+        &c.vault,
+        DISC_ACCEPT,
+        None,
+    );
+    assert_tx_ok(&mut svm, &c.counterparty, &[accept]);
+
+    let reprice = negotiate_ix(
+        &c.counterparty.pubkey(),
+        &c.covenant,
+        &c.vault,
+        DISC_UPDATE_OFFER,
+        Some(1_500_000_000),
+    );
+    assert_tx_err(&mut svm, &c.counterparty, &[reprice], ERR_FROZEN_AFTER_ACCEPT);
+}
+
+/// A non-party can neither negotiate nor accept.
+#[test]
+fn test_negotiate_rejects_non_party() {
+    let c = setup_sol_covenant(1000);
+    let mut svm = c.svm;
+    let stranger = Keypair::new();
+    svm.airdrop(&stranger.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+
+    set_active_er_unaccepted(&mut svm, &c.covenant);
+
+    let accept = negotiate_ix(
+        &stranger.pubkey(),
+        &c.covenant,
+        &c.vault,
+        DISC_ACCEPT,
+        None,
+    );
+    assert_tx_err(&mut svm, &stranger, &[accept], ERR_UNAUTHORIZED_SIGNER);
+
+    let reprice = negotiate_ix(
+        &stranger.pubkey(),
+        &c.covenant,
+        &c.vault,
+        DISC_UPDATE_OFFER,
+        Some(500_000_000),
+    );
+    assert_tx_err(&mut svm, &stranger, &[reprice], ERR_UNAUTHORIZED_SIGNER);
+}
+
+/// Settlement requires mutual acceptance — one-sided acceptance must not move
+/// funds out of the vault.
+#[test]
+fn test_swap_rejected_without_both_accepted() {
+    let c = setup_sol_covenant(1000);
+    let mut svm = c.svm;
+
+    // ActiveOnEr but nobody has accepted.
+    let mut acct = svm.get_account(&c.covenant).unwrap();
+    acct.data[191] = 2; // CovenantStatus::ActiveOnEr
+    svm.set_account(c.covenant, acct).unwrap();
+
+    let ix = swap_ix(
+        &c.covenant,
+        &c.vault,
+        &c.creator.pubkey(),
+        &c.counterparty.pubkey(),
+        &c.covenant,
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &system_program::ID,
+        &system_program::ID,
+        &system_program::ID,
+    );
+    assert_tx_err(&mut svm, &c.creator, &[ix], ERR_NOT_BOTH_ACCEPTED);
+    assert_eq!(
+        svm.get_account(&c.vault).unwrap().lamports,
+        c.creator_lock + c.cp_lock
+    );
+}
+
+/// A covenant whose counterparty never joined has no settlement path: the
+/// counterparty recipient cannot be resolved.
+#[test]
+fn test_settlement_rejects_unjoined_counterparty() {
+    let mut svm = setup_program();
+    let creator = Keypair::new();
+    let invitee = Keypair::new();
+    let fees = Keypair::new();
+    svm.airdrop(&creator.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+    svm.airdrop(&invitee.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+    svm.airdrop(&fees.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+
+    let lock = 2 * LAMPORTS_PER_SOL;
+    let (covenant, _) = covenant_pda(&creator.pubkey(), 3);
+    let (vault, _) = vault_pda(&covenant);
+
+    // Open covenant: no counterparty is pinned and nobody joins.
+    let init = initialize_ix(
+        &creator.pubkey(),
+        None,
+        AssetType::Sol,
+        &system_program::ID,
+        lock,
+        current_ts(&svm) + 1000,
+        3,
+        &covenant,
+        &vault,
+        &vault,
+        &vault,
+        &system_program::ID,
+    );
+    assert_tx_ok(&mut svm, &creator, &[init]);
+
+    let ix = cancel_ix(
+        &creator.pubkey(),
+        &covenant,
+        &vault,
+        &creator.pubkey(),
+        &invitee.pubkey(), // never joined
+        &vault,
+        &vault,
+        &vault,
+        &vault,
+        &system_program::ID,
+        &system_program::ID,
+    );
+    assert_tx_err(&mut svm, &creator, &[ix], ERR_COUNTERPARTY_NOT_JOINED);
+
+    assert_eq!(
+        svm.get_account(&vault).unwrap().lamports,
+        lock,
+        "creator's locked funds must survive a rejected cancel"
+    );
+}
+
+/// Sanity check that the legitimate refund path still returns exactly the
+/// locked amounts — the negative tests above must not have broken it.
+#[test]
+fn test_expire_refunds_exact_locked_amounts() {
+    let mut c = setup_sol_covenant(60);
+    advance_clock_past_deadline(&mut c.svm, c.deadline);
+    let mut svm = c.svm;
+
+    let creator_before = svm.get_balance(&c.creator.pubkey()).unwrap();
+    let cp_before = svm.get_balance(&c.counterparty.pubkey()).unwrap();
+
+    let ix = expire_ix(
+        &c.creator.pubkey(),
+        &c.covenant,
+        &c.vault,
+        &c.creator.pubkey(),
+        &c.counterparty.pubkey(),
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &c.vault,
+        &system_program::ID,
+        &system_program::ID,
+    );
+    assert_tx_ok(&mut svm, &c.creator, &[ix]);
+
+    let creator_after = svm.get_balance(&c.creator.pubkey()).unwrap();
+    let cp_after = svm.get_balance(&c.counterparty.pubkey()).unwrap();
+
+    // The creator signs and therefore pays the 5000-lamport fee; the
+    // counterparty is untouched by fees. Both recover exactly their own lock.
+    assert_eq!(
+        delta(creator_before, creator_after),
+        c.creator_lock as i128 - TX_FEE as i128,
+        "creator must recover exactly their lock, less the fee they paid"
+    );
+    assert_eq!(
+        delta(cp_before, cp_after),
+        c.cp_lock as i128,
+        "counterparty must recover exactly their lock"
+    );
 }
