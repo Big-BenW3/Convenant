@@ -1,18 +1,10 @@
 import type { ClusterMoniker } from "./solana-client";
 
 export function getExplorerUrl(path: string, cluster: ClusterMoniker): string {
-  const base = "https://explorer.solana.com";
-  const url = new URL(path, base);
-
-  if (cluster !== "mainnet") {
-    if (cluster === "localnet") {
-      url.searchParams.set("cluster", "custom");
-      url.searchParams.set("customUrl", "http://localhost:8899");
-    } else {
-      url.searchParams.set("cluster", cluster);
-    }
-  }
-
+  const url = new URL(path, "https://explorer.solana.com");
+  // Devnet-only, so the cluster is always passed explicitly; without it the
+  // explorer defaults to mainnet.
+  url.searchParams.set("cluster", cluster);
   return url.toString();
 }
 

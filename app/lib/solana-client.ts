@@ -1,43 +1,49 @@
 import { createEmptyClient } from "@solana/kit";
-import { rpc, rpcAirdrop } from "@solana/kit-plugin-rpc";
+import { rpc } from "@solana/kit-plugin-rpc";
 
-export type ClusterMoniker = "devnet" | "testnet" | "mainnet" | "localnet";
+/**
+ * Convenant runs against MagicBlock devnet only.
+ *
+ * The program is deployed to one MagicBlock devnet cluster, and every ER the
+ * app talks to is a child of that same cluster. Pointing any part of the client
+ * at mainnet or public devnet would send a devnet-only program client somewhere
+ * the program does not exist — and public devnet is a *different* cluster from
+ * MagicBlock devnet, so accounts would appear empty rather than erroring.
+ */
+export type ClusterMoniker = "devnet";
 
-export const CLUSTERS: ClusterMoniker[] = [
-  "devnet",
-  "testnet",
-  "mainnet",
-  "localnet",
-];
+export const CLUSTERS: ClusterMoniker[] = ["devnet"];
 
 const CLUSTER_URLS: Record<ClusterMoniker, string> = {
   devnet: "https://rpc.magicblock.app/devnet",
-  testnet: "https://api.testnet.solana.com",
-  mainnet: "https://api.mainnet-beta.solana.com",
-  localnet: "http://localhost:8899",
 };
 
-const WS_URLS: Record<ClusterMoniker, string> = {
-  devnet: "wss://api.devnet.solana.com",
-  testnet: "wss://api.testnet.solana.com",
-  mainnet: "wss://api.mainnet-beta.solana.com",
-  localnet: "ws://localhost:8900",
+/**
+ * MagicBlock devnet serves its websocket on the same host as the RPC.
+ *
+ * This must stay the *same cluster* as CLUSTER_URLS: public
+ * `api.devnet.solana.com` is a different cluster from MagicBlock devnet, so
+ * subscribing there would stream notifications for accounts the RPC cannot see.
+ */
+const CLUSTER_WS_URLS: Record<ClusterMoniker, string> = {
+  devnet: "wss://rpc.magicblock.app/devnet",
 };
+
+export function getClusterWsConfig(cluster: ClusterMoniker) {
+  return { url: CLUSTER_WS_URLS[cluster] };
+}
 
 export function getClusterUrl(cluster: ClusterMoniker) {
   return CLUSTER_URLS[cluster];
 }
 
-export function getClusterWsConfig(cluster: ClusterMoniker) {
-  return cluster === "localnet" ? { url: WS_URLS[cluster] } : undefined;
-}
-
 export function createSolanaClient(cluster: ClusterMoniker) {
-  const url = CLUSTER_URLS[cluster];
-  const wsUrl = WS_URLS[cluster];
-  return createEmptyClient()
-    .use(rpc(url, { url: wsUrl }))
-    .use(rpcAirdrop());
+  // No `rpcAirdrop()`: MagicBlock devnet rejects airdrops through the standard
+  // RPC, and enabling the plugin on a shared client would advertise a faucet
+  // against a cluster that has none.
+  return createEmptyClient().use(
+    rpc(CLUSTER_URLS[cluster], { url: CLUSTER_WS_URLS[cluster] })
+  );
 }
 
 export type SolanaClient = ReturnType<typeof createSolanaClient>;
