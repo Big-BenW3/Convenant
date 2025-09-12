@@ -13,6 +13,8 @@ import {
   getAcceptInstruction,
   getCommitAndSwapInstructionAsync,
   getExpireAndRefundInstructionAsync,
+  getInitPermissionInstructionAsync,
+  getCovenantDecoder,
   type Covenant,
 } from "../../generated/convenant";
 import { useWallet } from "../../lib/wallet/context";
@@ -34,9 +36,20 @@ import {
   TOKEN_PROGRAM_ID,
   DEMO_MINTS,
   rememberCovenant,
+  permissionAddress,
+  PERMISSION_PROGRAM_ID,
 } from "../../lib/covenant";
 import { getClusterUrl } from "../../lib/solana-client";
-import { getDelegationStatus, pickTeeValidator, MAGIC_PROGRAM_ID, MAGIC_CONTEXT_ID } from "../../lib/magicblock";
+import {
+  getDelegationStatus,
+  pickTeeValidator,
+  erEndpointUrl,
+  getAuthTokenFor,
+  readPrivateCovenant,
+  MAGIC_PROGRAM_ID,
+  MAGIC_CONTEXT_ID,
+  EPHEMERAL_VAULT_ID,
+} from "../../lib/magicblock";
 import { ellipsify } from "../../lib/explorer";
 import { GridBackground } from "../../components/grid-background";
 import { WalletButton } from "../../components/wallet-button";
@@ -92,6 +105,10 @@ export default function CovenantDetailPage() {
   );
 
   const [erHost, setErHost] = useState<string | undefined>(undefined);
+  // TEE bearer token for private reads. The ER refuses unauthenticated
+  // getAccountInfo against a private account, so a party needs one to see
+  // live terms after delegation.
+  const [erToken, setErToken] = useState<string | undefined>(undefined);
   const { send: sendEr } = useSendErTransaction(erHost);
 
   // Discover the live ER endpoint once the covenant is delegated.
@@ -102,7 +119,9 @@ export default function CovenantDetailPage() {
       try {
         const status = await getDelegationStatus(covenantKey!);
         if (alive && status.isDelegated && status.fqdn) {
-          setErHost(`https://${status.fqdn}`);
+          // The router has been seen returning a duplicated scheme
+          // (`https://https://host/`), so normalise before using it.
+          setErHost(erEndpointUrl(status.fqdn));
         }
       } catch {
         /* router may not know the account yet — keep polling */
@@ -114,23 +133,85 @@ export default function CovenantDetailPage() {
       alive = false;
       clearInterval(t);
     };
-  }, [covenant, covenantKey]);
+    // Deliberately depends only on the covenant address: `covenant` is a new
+    // object on every poll, and including it would recreate this interval each
+    // tick so it could never fire.
+  }, [covenantKey]);
 
   useEffect(() => {
     rememberCovenant(id);
   }, [id]);
 
-  // Poll covenant state (fast while on the ER).
+  // Obtain a TEE bearer token once the ER endpoint is known. The TEE challenge
+  // is a plain message signature, which a kit `TransactionSigner` does not
+  // expose, so this looks for a wallet-standard session on the signer object.
+  useEffect(() => {
+    if (!erHost || !signer) return;
+    let cancelled = false;
+
+    const signMessage = (signer as unknown as {
+      signMessage?: (msgs: readonly { message: Uint8Array }[]) => Promise<readonly Uint8Array[]>;
+    }).signMessage;
+    if (typeof signMessage !== "function") return;
+
+    void (async () => {
+      try {
+        const { token } = await getAuthTokenFor(
+          erHost,
+          signer.address,
+          async (msg) => {
+            const sigs = await signMessage([{ message: msg }]);
+            const first = sigs[0];
+            if (!first) throw new Error("Wallet did not return a signature.");
+            return first;
+          },
+        );
+        if (!cancelled) setErToken(token);
+      } catch (err) {
+        // Non-fatal: the UI falls back to the base-layer snapshot.
+        if (!cancelled) {
+          console.warn("TEE auth failed; falling back to base reads", err);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [erHost, signer]);
+
+  // Poll covenant state. Once the account is delegated its authoritative state
+  // lives on the ER, and the tokenized TEE refuses unauthenticated reads, so
+  // keep using the last base-layer snapshot rather than erroring on every tick.
   useEffect(() => {
     if (!covenantKey) return;
     let alive = true;
     const poll = async () => {
       setNowMs(Date.now());
-      const acc = await readCovenant(readRpc, covenantKey);
-      if (alive) {
+      if (erHost) {
+        try {
+          if (erToken) {
+            const acc = await readPrivateCovenant(
+              erHost,
+              erToken,
+              covenantKey,
+              (bytes) => getCovenantDecoder().decode(bytes),
+            );
+            if (alive && acc) setCovenant(acc);
+            return;
+          }
+        } catch {
+          // Fall through to the base-layer read below.
+        }
+      }
+      try {
+        const acc = await readCovenant(readRpc, covenantKey);
+        if (!alive) return;
         if (acc) setCovenant(acc);
         else setNotFound(true);
         setLoading(false);
+      } catch {
+        // Keep the previous snapshot; a transient RPC failure should not blank
+        // the page or wedge it on "Loading…".
       }
     };
     void poll();
@@ -139,7 +220,7 @@ export default function CovenantDetailPage() {
       alive = false;
       clearInterval(t);
     };
-  }, [readRpc, covenantKey]);
+  }, [readRpc, covenantKey, erHost]);
 
   const meta = useMemo(
     () => (covenant ? statusMeta(covenant.status) : undefined),
@@ -249,14 +330,38 @@ export default function CovenantDetailPage() {
 
   const doDelegate = () =>
     run("delegate", async (s) => {
+      // Fails loudly rather than falling back: delegating to a non-TEE node
+      // would silently disable the private reads this product is built on.
       const route = await pickTeeValidator();
-      if (!route) throw new Error("No TEE ER route available from the router (getRoutes).");
       const ix = await getDelegateCovenantInstructionAsync({
         payer: s,
         covenant: covenantKey,
         validator: address(route.identity) as never,
       });
       return send({ instructions: [ix] });
+    });
+
+  /**
+   * Create the private permission on the ER. Until this exists the covenant is
+   * delegated but ungated, so the TEE refuses private reads for both parties.
+   * Runs on the ER, paying rent from the covenant PDA's mirrored lamports.
+   */
+  const doInitPermission = () =>
+    run("init-permission", async (s) => {
+      if (!erHost) {
+        throw new Error(
+          "The covenant is still being delegated. This runs on the ephemeral rollup.",
+        );
+      }
+      const ix = await getInitPermissionInstructionAsync({
+        payer: s,
+        covenant: covenantKey,
+        permission: await permissionAddress(covenantKey),
+        permissionProgram: address(PERMISSION_PROGRAM_ID),
+        ephemeralVault: address(EPHEMERAL_VAULT_ID),
+        magicProgram: address(MAGIC_PROGRAM_ID),
+      });
+      return sendEr({ instructions: [ix] });
     });
 
   const doUpdateOffer = () =>
@@ -480,6 +585,31 @@ export default function CovenantDetailPage() {
                 className="w-full cursor-pointer bg-primary py-3 text-xs font-medium uppercase tracking-[0.2em] text-primary-foreground transition hover:bg-primary/85 disabled:opacity-40"
               >
                 {op === "sending" ? "Delegating…" : "Delegate to ER"}
+              </button>
+            </section>
+          )}
+
+          {/* Private permission gate — must exist before either party can read
+              live terms off the TEE. */}
+          {showNegotiate && isParty && !erToken && (
+            <section className="mt-6 border border-border-low p-5">
+              <p className="mb-1 text-sm font-medium uppercase tracking-[0.12em]">
+                Open the private channel
+              </p>
+              <p className="mb-4 text-xs text-muted">
+                Creates the permission that gates this covenant on the rollup.
+                Until it exists, both parties are refused private reads.
+              </p>
+              <button
+                onClick={doInitPermission}
+                disabled={walletStatus !== "connected" || op === "sending" || !erHost}
+                className="w-full cursor-pointer bg-primary py-3 text-xs font-medium uppercase tracking-[0.2em] text-primary-foreground transition hover:bg-primary/85 disabled:opacity-40"
+              >
+                {op === "sending"
+                  ? "Creating…"
+                  : erHost
+                    ? "Create private permission"
+                    : "Waiting for rollup…"}
               </button>
             </section>
           )}
