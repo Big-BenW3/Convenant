@@ -747,6 +747,7 @@ async function main() {
   const updOff = getUpdateOfferInstruction({
     payer: cp,
     covenant: covenantKey,
+    vault: vault,
     newAmount: cpAmount1,
   });
   const sigUpdate = await erClient(cp, erRpcEndpoint).sendTransaction([updOff]);
@@ -765,8 +766,8 @@ async function main() {
   );
   console.log("  offer updated to 0.3 SOL");
 
-  await erClient(creator, erRpcEndpoint).sendTransaction([getAcceptInstruction({ payer: creator, covenant: covenantKey })]);
-  const sigAcceptCp = await erClient(cp, erRpcEndpoint).sendTransaction([getAcceptInstruction({ payer: cp, covenant: covenantKey })]);
+  await erClient(creator, erRpcEndpoint).sendTransaction([getAcceptInstruction({ payer: creator, covenant: covenantKey, vault })]);
+  const sigAcceptCp = await erClient(cp, erRpcEndpoint).sendTransaction([getAcceptInstruction({ payer: cp, covenant: covenantKey, vault })]);
   console.log("  both accepted (cp accept", sigAcceptCp + ")");
   await waitFor(
     "both_accepted + ActiveOnEr",
@@ -1202,9 +1203,9 @@ async function main() {
   console.log("  private read ok:", assetState(privCC));
 
   // 7. ACCEPT (no negotiation — fixed terms).
-  await erClient(creator, erRpcEndpoint).sendTransaction([getAcceptInstruction({ payer: creator, covenant: covenantKey4 })]);
+  await erClient(creator, erRpcEndpoint).sendTransaction([getAcceptInstruction({ payer: creator, covenant: covenantKey4, vault: vault4 })]);
   const erCpC = erClient(cp, erRpcEndpoint);
-  await erCpC.sendTransaction([getAcceptInstruction({ payer: cp, covenant: covenantKey4 })]);
+  await erCpC.sendTransaction([getAcceptInstruction({ payer: cp, covenant: covenantKey4, vault: vault4 })]);
   console.log("  both accepted");
   await waitFor(
     "FLOW C both_accepted",

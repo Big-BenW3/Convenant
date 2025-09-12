@@ -23,7 +23,9 @@ import {
   setTransactionMessageLifetimeUsingBlockhash,
   signTransaction,
   type Address,
+  type Blockhash,
   type Instruction,
+  type ReadonlyUint8Array,
   type TransactionSigner,
 } from "@solana/kit";
 import {
@@ -80,14 +82,17 @@ async function signAndSend(
 ): Promise<string> {
   const { value: blockhashInfo } = await rpcCall<{
     value: { blockhash: string; lastValidBlockHeight: number };
-  }>("getLatestBlockhash");
+  }>("getLatestBlockhash", []);
   const { blockhash, lastValidBlockHeight } = blockhashInfo;
 
   const base = createTransactionMessage({ version: 0 });
   const withPayer = setTransactionMessageFeePayerSigner(payer, base);
   const withIxs = appendTransactionMessageInstructions(instructions, withPayer);
   const withLifetime = setTransactionMessageLifetimeUsingBlockhash(
-    { blockhash, lastValidBlockHeight: BigInt(lastValidBlockHeight) },
+    {
+      blockhash: blockhash as Blockhash,
+      lastValidBlockHeight: BigInt(lastValidBlockHeight),
+    },
     withIxs,
   );
   const compiled = compileTransaction(withLifetime);
@@ -125,7 +130,7 @@ async function waitForConfirmation(
   return null;
 }
 
-async function pda(seeds: Uint8Array[]): Promise<Address> {
+async function pda(seeds: ReadonlyUint8Array[]): Promise<Address> {
   const [key] = await getProgramDerivedAddress({ programAddress: PROGRAM, seeds });
   return key;
 }
@@ -151,11 +156,16 @@ async function main() {
     }
   }
 
+  // Nonce is a u64 little-endian seed, matching `nonce.to_le_bytes()` in Rust.
   const nonce = BigInt(Date.now());
+  const nonceLe = new Uint8Array(8);
+  for (let i = 0; i < 8; i++) {
+    nonceLe[i] = Number((nonce >> BigInt(8 * i)) & 0xffn);
+  }
   const covenant = await pda([
     new TextEncoder().encode("covenant"),
     getAddressEncoder().encode(creator.address),
-    new Uint8Array(new Uint8Array(8).map((_, i) => Number((nonce >> BigInt(8 * i)) & 0xffn))),
+    nonceLe,
   ]);
   const vault = await pda([
     new TextEncoder().encode("vault"),
