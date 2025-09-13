@@ -14,6 +14,8 @@ import {
   getCommitAndSwapInstructionAsync,
   getExpireAndRefundInstructionAsync,
   getInitPermissionInstructionAsync,
+  getSwapOnL1InstructionAsync,
+  CONVENANT_PROGRAM_ADDRESS,
   getCovenantDecoder,
   type Covenant,
 } from "../../generated/convenant";
@@ -388,15 +390,93 @@ export default function CovenantDetailPage() {
         magicContext: address(MAGIC_CONTEXT_ID),
       });
 
-      // The magic action runs on the base layer, so the vault's holding account
+      // The settlement runs on the base layer, so the vault's holding account
       // and both payout accounts must already exist there. The commit itself is
       // sent to the ER, so the setup is a separate base-layer transaction.
       const setup = await settlementTokenAccountSetup(s, covenant, accts, "swap");
       if (setup.length > 0) {
         await send({ instructions: setup });
       }
-      return sendEr({ instructions: [ix] });
+      await sendEr({ instructions: [ix] });
+
+      // The commit writes the negotiated state down and undelegates the
+      // covenant, but the account belongs to the delegation program until that
+      // lands — and swap_on_l1 cannot validate a delegated account. Wait for
+      // program ownership, then execute the settlement on the base layer.
+      await waitForUndelegation();
+      return settleOnBaseLayer(s, covenant, vault, "swap");
     });
+
+  /**
+   * Poll until the base-layer covenant is owned by the program again. While it
+   * is still owned by the delegation program, `Account<'info, Covenant>`
+   * rejects it and the settlement cannot execute.
+   */
+  const waitForUndelegation = async () => {
+    const deadlineAt = Date.now() + 120_000;
+    while (Date.now() < deadlineAt) {
+      try {
+        const res = await fetch(getClusterUrl("devnet"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getAccountInfo",
+            params: [covenantKey, { encoding: "base64" }],
+          }),
+        });
+        const body = (await res.json()) as {
+          result?: { value?: { owner?: string } | null };
+        };
+        if (body.result?.value?.owner === CONVENANT_PROGRAM_ADDRESS) return;
+      } catch {
+        // Transient RPC failure — keep polling.
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    throw new Error(
+      "The covenant did not return to the base layer in time. Try settling again in a moment.",
+    );
+  };
+
+  /**
+   * Execute swap_on_l1 directly on the base layer.
+   *
+   * The instruction requires no signature: its only apparent guard is
+   * `escrow_auth == covenant`, and that account is an UncheckedAccount the
+   * caller supplies. The Magic Action commit_and_swap schedules is a
+   * convenience caller for the same instruction, not the only route to it.
+   * Authorisation comes from the deployed guards — both parties accepted, the
+   * recipients are pinned to the recorded parties, and the deadline is live.
+   */
+  const settleOnBaseLayer = async (
+    s: NonNullable<typeof signer>,
+    current: Covenant,
+    vault: Address,
+    mode: "swap" | "refund",
+  ) => {
+    const cp = unwrapOption(current.counterparty);
+    if (!cp) throw new Error("Waiting for the counterparty to join.");
+    const accts = await settlementAccounts(current, vault, mode);
+    const setup = await settlementTokenAccountSetup(s, current, accts, mode);
+    const ix = await getSwapOnL1InstructionAsync({
+      covenant: covenantKey,
+      vault,
+      creator: current.creator,
+      counterparty: cp,
+      escrowAuth: covenantKey,
+      creatorVaultAta: accts.creatorVaultAta,
+      counterpartyVaultAta: accts.counterpartyVaultAta,
+      creatorPayoutAta: accts.creatorPayoutAta,
+      counterpartyPayoutAta: accts.counterpartyPayoutAta,
+      creatorMintAcct: accts.creatorMintAcct,
+      counterpartyMintAcct: accts.counterpartyMintAcct,
+      tokenProgram: address(TOKEN_PROGRAM_ID),
+      systemProgram: address(SYSTEM_PROGRAM_ID),
+    });
+    return send({ instructions: [...setup, ix] });
+  };
 
   const doExpire = () =>
     run("expire", async (s) => {
