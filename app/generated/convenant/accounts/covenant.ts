@@ -101,6 +101,19 @@ export type Covenant = {
   vaultBump: number;
   createdAt: bigint;
   settledAt: Option<bigint>;
+  /**
+   * Total value actually locked in the vault, set once both parties have
+   * joined.
+   *
+   * Negotiation runs on the ephemeral rollup, where the vault PDA is *not*
+   * delegated and therefore not readable — a party cannot check what the
+   * escrow holds from there. Recording the total here makes the solvency
+   * bound available in the same state the negotiation reads, so
+   * `update_offer` can reject a re-price the vault could never cover.
+   *
+   * Appended last so the field offsets used by the LiteSVM tests stay stable.
+   */
+  escrowTotal: bigint;
 };
 
 export type CovenantArgs = {
@@ -138,6 +151,19 @@ export type CovenantArgs = {
   vaultBump: number;
   createdAt: number | bigint;
   settledAt: OptionOrNullable<number | bigint>;
+  /**
+   * Total value actually locked in the vault, set once both parties have
+   * joined.
+   *
+   * Negotiation runs on the ephemeral rollup, where the vault PDA is *not*
+   * delegated and therefore not readable — a party cannot check what the
+   * escrow holds from there. Recording the total here makes the solvency
+   * bound available in the same state the negotiation reads, so
+   * `update_offer` can reject a re-price the vault could never cover.
+   *
+   * Appended last so the field offsets used by the LiteSVM tests stay stable.
+   */
+  escrowTotal: number | bigint;
 };
 
 /** Gets the encoder for {@link CovenantArgs} account data. */
@@ -165,6 +191,7 @@ export function getCovenantEncoder(): Encoder<CovenantArgs> {
       ["vaultBump", getU8Encoder()],
       ["createdAt", getI64Encoder()],
       ["settledAt", getOptionEncoder(getI64Encoder())],
+      ["escrowTotal", getU64Encoder()],
     ]),
     (value) => ({ ...value, discriminator: COVENANT_DISCRIMINATOR }),
   );
@@ -194,6 +221,7 @@ export function getCovenantDecoder(): Decoder<Covenant> {
     ["vaultBump", getU8Decoder()],
     ["createdAt", getI64Decoder()],
     ["settledAt", getOptionDecoder(getI64Decoder())],
+    ["escrowTotal", getU64Decoder()],
   ]);
 }
 

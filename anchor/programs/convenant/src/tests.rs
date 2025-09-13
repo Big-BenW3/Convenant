@@ -398,9 +398,10 @@ fn close_ix(signer: &Pubkey, covenant: &Pubkey) -> Instruction {
     }
 }
 
-/// `update_offer` / `accept` share the `Negotiate` context: payer (signer),
-/// covenant, vault.
-fn negotiate_ix(payer: &Pubkey, covenant: &Pubkey, vault: &Pubkey, disc: [u8; 8], amount: Option<u64>) -> Instruction {
+/// `update_offer` / `accept` share the `Negotiate` context: payer (signer) and
+/// covenant. The vault is deliberately absent — it is not delegated to the ER,
+/// so it cannot be an account of an ER-side instruction.
+fn negotiate_ix(payer: &Pubkey, covenant: &Pubkey, disc: [u8; 8], amount: Option<u64>) -> Instruction {
     let mut data = disc.to_vec();
     if let Some(a) = amount {
         data.extend_from_slice(&a.to_le_bytes());
@@ -410,7 +411,6 @@ fn negotiate_ix(payer: &Pubkey, covenant: &Pubkey, vault: &Pubkey, disc: [u8; 8]
         accounts: vec![
             AccountMeta::new(*payer, true),
             AccountMeta::new(*covenant, false),
-            AccountMeta::new(*vault, false),
         ],
         data,
     }
@@ -1613,34 +1613,64 @@ fn set_active_er_unaccepted(svm: &mut LiteSVM, covenant: &Pubkey) {
     svm.set_account(*covenant, acct).unwrap();
 }
 
-/// A party must not be able to re-price its offer beyond what the vault holds.
-/// Previously `update_offer` accepted any amount, so a party could negotiate an
-/// offer larger than its own deposit and the vault could not cover settlement.
+/// A party must not be able to re-price beyond what is actually escrowed.
+/// Negotiation runs on the ER where the vault is not readable, so the bound is
+/// `escrow_total` recorded at join: the two offers together may never exceed it.
 #[test]
-fn test_update_offer_rejects_amount_above_vault_balance() {
+fn test_update_offer_rejects_insolvent_repricing() {
     let c = setup_sol_covenant(1000);
     let mut svm = c.svm;
 
     set_active_er_unaccepted(&mut svm, &c.covenant);
 
-    let vault_lamports = svm.get_account(&c.vault).unwrap().lamports;
-    let too_much = vault_lamports + 1;
+    let escrow_total = c.creator_lock + c.cp_lock;
+    // The creator already offers creator_lock, so the counterparty may raise its
+    // own offer by at most the creator's lock without exceeding the escrow.
+    let max_cp_offer = escrow_total - c.creator_lock;
+    let too_much = max_cp_offer + 1;
 
     let ix = negotiate_ix(
         &c.counterparty.pubkey(),
         &c.covenant,
-        &c.vault,
         DISC_UPDATE_OFFER,
         Some(too_much),
     );
     assert_tx_err(&mut svm, &c.counterparty, &[ix], ERR_INSUFFICIENT_FUNDS);
 
-    // Terms unchanged: the escrow still holds the original amounts.
+    // Terms unchanged and the escrow is untouched.
     assert_eq!(
         svm.get_account(&c.vault).unwrap().lamports,
         c.creator_lock + c.cp_lock,
         "a rejected re-price must not move funds"
     );
+
+    // Raising to exactly the escrow total is allowed.
+    let ix = negotiate_ix(
+        &c.counterparty.pubkey(),
+        &c.covenant,
+        DISC_UPDATE_OFFER,
+        Some(max_cp_offer),
+    );
+    assert_tx_ok(&mut svm, &c.counterparty, &[ix]);
+}
+
+/// The creator side is bounded by the same rule.
+#[test]
+fn test_update_offer_rejects_insolvent_creator_repricing() {
+    let c = setup_sol_covenant(1000);
+    let mut svm = c.svm;
+
+    set_active_er_unaccepted(&mut svm, &c.covenant);
+
+    let escrow_total = c.creator_lock + c.cp_lock;
+    let too_much = escrow_total + 1;
+    let ix = negotiate_ix(
+        &c.creator.pubkey(),
+        &c.covenant,
+        DISC_UPDATE_OFFER,
+        Some(too_much),
+    );
+    assert_tx_err(&mut svm, &c.creator, &[ix], ERR_INSUFFICIENT_FUNDS);
 }
 
 /// Zero is rejected — and the handler must validate *before* writing, so a
@@ -1655,7 +1685,6 @@ fn test_update_offer_rejects_zero_amount() {
     let ix = negotiate_ix(
         &c.counterparty.pubkey(),
         &c.covenant,
-        &c.vault,
         DISC_UPDATE_OFFER,
         Some(0),
     );
@@ -1674,7 +1703,6 @@ fn test_update_offer_rejected_after_accept() {
     let accept = negotiate_ix(
         &c.counterparty.pubkey(),
         &c.covenant,
-        &c.vault,
         DISC_ACCEPT,
         None,
     );
@@ -1683,7 +1711,6 @@ fn test_update_offer_rejected_after_accept() {
     let reprice = negotiate_ix(
         &c.counterparty.pubkey(),
         &c.covenant,
-        &c.vault,
         DISC_UPDATE_OFFER,
         Some(1_500_000_000),
     );
@@ -1703,7 +1730,6 @@ fn test_negotiate_rejects_non_party() {
     let accept = negotiate_ix(
         &stranger.pubkey(),
         &c.covenant,
-        &c.vault,
         DISC_ACCEPT,
         None,
     );
@@ -1712,7 +1738,6 @@ fn test_negotiate_rejects_non_party() {
     let reprice = negotiate_ix(
         &stranger.pubkey(),
         &c.covenant,
-        &c.vault,
         DISC_UPDATE_OFFER,
         Some(500_000_000),
     );

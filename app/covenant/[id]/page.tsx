@@ -82,23 +82,6 @@ export default function CovenantDetailPage() {
   const readRpc = useMemo(() => createReadRpc(getClusterUrl("devnet")), []);
 
   const covenantKey = useMemo(() => (id ? address(id) : undefined), [id]);
-  // Derived once and shared by every handler: the escrow vault is a pure
-  // function of the covenant address, and `update_offer`/`accept` now take it
-  // as an account. `vaultAddress` is async, so it lands in state.
-  const [vaultKey, setVaultKey] = useState<Address | undefined>(undefined);
-  useEffect(() => {
-    let cancelled = false;
-    if (!covenantKey) {
-      setVaultKey(undefined);
-      return;
-    }
-    void vaultAddress(covenantKey).then((v) => {
-      if (!cancelled) setVaultKey(v);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [covenantKey]);
   const me = useMemo(
     () => (signer ? signer.address : undefined),
     [signer]
@@ -368,11 +351,9 @@ export default function CovenantDetailPage() {
     run("update-offer", async (s) => {
       const amount = Number(newAmount);
       if (!amount || amount <= 0) throw new Error("Enter an amount greater than zero.");
-      if (!vaultKey) throw new Error("Covenant vault is not known yet.");
       const ix = getUpdateOfferInstruction({
         payer: s,
         covenant: covenantKey,
-        vault: vaultKey,
         newAmount: BigInt(amount),
       });
       return sendEr({ instructions: [ix] });
@@ -380,8 +361,7 @@ export default function CovenantDetailPage() {
 
   const doAccept = () =>
     run("accept", async (s) => {
-      if (!vaultKey) throw new Error("Covenant vault is not known yet.");
-      const ix = getAcceptInstruction({ payer: s, covenant: covenantKey, vault: vaultKey });
+      const ix = getAcceptInstruction({ payer: s, covenant: covenantKey });
       return sendEr({ instructions: [ix] });
     });
 

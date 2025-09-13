@@ -30,6 +30,16 @@ declare_id!("2uY6gVNHe62XZXByt796pbwye1p7eTu2Nftv7uwC5CtQ");
 /// see the other's committed offer privately, while third parties cannot.
 const AUTHORITY: u8 = 1 << 0;
 
+/// Lamports pre-funded into the covenant PDA so it can pay the Magic Action
+/// execution fee.
+///
+/// The covenant PDA doubles as the escrow authority for the post-commit action
+/// (`CallHandler::escrow_authority`), and the magic program draws that action's
+/// fee from the authority when the action runs on the base layer. Without a
+/// reserve the commit succeeds but the action fails to pay and never executes,
+/// leaving the covenant stuck on the rollup with its funds escrowed.
+const ACTION_FEE_RESERVE: u64 = 500_000_000;
+
 #[ephemeral]
 #[program]
 pub mod convenant {
@@ -113,9 +123,15 @@ pub mod convenant {
             )?;
         }
 
-        // Pre-fund the covenant PDA with rent for the ephemeral permission
-        // account that `init_permission` deposits on the ER after delegation
-        // (the delegated covenant PDA's lamports are the ones spendable there).
+        // Pre-fund the covenant PDA with (a) rent for the ephemeral permission
+        // account that `init_permission` deposits on the ER after delegation,
+        // and (b) the reserve that pays the settlement action's fee. The
+        // delegated covenant PDA's lamports are the ones spendable on the ER
+        // and on the base-layer action, so both must land here at create time.
+        let prefund = ephemeral_rollups_sdk::ephemeral_accounts::rent(
+            EphemeralPermission::size_of(2) as u32,
+        )
+        .saturating_add(ACTION_FEE_RESERVE);
         transfer(
             CpiContext::new(
                 anchor_lang::system_program::ID,
@@ -124,9 +140,7 @@ pub mod convenant {
                     to: ctx.accounts.covenant.to_account_info(),
                 },
             ),
-            ephemeral_rollups_sdk::ephemeral_accounts::rent(
-                EphemeralPermission::size_of(2) as u32,
-            ),
+            prefund,
         )?;
 
         Ok(())

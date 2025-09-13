@@ -82,25 +82,25 @@ export type CommitAndSwapInstruction<
         ? WritableAccount<TAccountCovenant>
         : TAccountCovenant,
       TAccountVault extends string
-        ? WritableAccount<TAccountVault>
+        ? ReadonlyAccount<TAccountVault>
         : TAccountVault,
       TAccountCreator extends string
-        ? WritableAccount<TAccountCreator>
+        ? ReadonlyAccount<TAccountCreator>
         : TAccountCreator,
       TAccountCounterparty extends string
-        ? WritableAccount<TAccountCounterparty>
+        ? ReadonlyAccount<TAccountCounterparty>
         : TAccountCounterparty,
       TAccountCreatorVaultAta extends string
-        ? WritableAccount<TAccountCreatorVaultAta>
+        ? ReadonlyAccount<TAccountCreatorVaultAta>
         : TAccountCreatorVaultAta,
       TAccountCounterpartyVaultAta extends string
-        ? WritableAccount<TAccountCounterpartyVaultAta>
+        ? ReadonlyAccount<TAccountCounterpartyVaultAta>
         : TAccountCounterpartyVaultAta,
       TAccountCreatorPayoutAta extends string
-        ? WritableAccount<TAccountCreatorPayoutAta>
+        ? ReadonlyAccount<TAccountCreatorPayoutAta>
         : TAccountCreatorPayoutAta,
       TAccountCounterpartyPayoutAta extends string
-        ? WritableAccount<TAccountCounterpartyPayoutAta>
+        ? ReadonlyAccount<TAccountCounterpartyPayoutAta>
         : TAccountCounterpartyPayoutAta,
       TAccountCreatorMintAcct extends string
         ? ReadonlyAccount<TAccountCreatorMintAcct>
@@ -172,10 +172,18 @@ export type CommitAndSwapAsyncInput<
 > = {
   payer: TransactionSigner<TAccountPayer>;
   covenant: Address<TAccountCovenant>;
+  /**
+   * The escrow vault and the token accounts below are **base-layer only**.
+   * They are not delegated to the ER, so passing them as writable accounts
+   * on an ER transaction fails with `InvalidWritableAccount`. This
+   * instruction only needs their addresses — it builds the Magic Action's
+   * account list and schedules it; `swap_on_l1` is what actually touches
+   * them, and that runs on the base layer where they are writable.
+   */
   vault?: Address<TAccountVault>;
   /**
-   * counterparty's offer. Constrained so the scheduled action cannot be
-   * pointed at an attacker-chosen payout.
+   * read here to build the action's account list; the action itself
+   * constrains the payout.
    */
   creator: Address<TAccountCreator>;
   counterparty: Address<TAccountCounterparty>;
@@ -254,21 +262,24 @@ export async function getCommitAndSwapInstructionAsync<
   const originalAccounts = {
     payer: { value: input.payer ?? null, isWritable: true },
     covenant: { value: input.covenant ?? null, isWritable: true },
-    vault: { value: input.vault ?? null, isWritable: true },
-    creator: { value: input.creator ?? null, isWritable: true },
-    counterparty: { value: input.counterparty ?? null, isWritable: true },
-    creatorVaultAta: { value: input.creatorVaultAta ?? null, isWritable: true },
+    vault: { value: input.vault ?? null, isWritable: false },
+    creator: { value: input.creator ?? null, isWritable: false },
+    counterparty: { value: input.counterparty ?? null, isWritable: false },
+    creatorVaultAta: {
+      value: input.creatorVaultAta ?? null,
+      isWritable: false,
+    },
     counterpartyVaultAta: {
       value: input.counterpartyVaultAta ?? null,
-      isWritable: true,
+      isWritable: false,
     },
     creatorPayoutAta: {
       value: input.creatorPayoutAta ?? null,
-      isWritable: true,
+      isWritable: false,
     },
     counterpartyPayoutAta: {
       value: input.counterpartyPayoutAta ?? null,
-      isWritable: true,
+      isWritable: false,
     },
     creatorMintAcct: {
       value: input.creatorMintAcct ?? null,
@@ -371,10 +382,18 @@ export type CommitAndSwapInput<
 > = {
   payer: TransactionSigner<TAccountPayer>;
   covenant: Address<TAccountCovenant>;
+  /**
+   * The escrow vault and the token accounts below are **base-layer only**.
+   * They are not delegated to the ER, so passing them as writable accounts
+   * on an ER transaction fails with `InvalidWritableAccount`. This
+   * instruction only needs their addresses — it builds the Magic Action's
+   * account list and schedules it; `swap_on_l1` is what actually touches
+   * them, and that runs on the base layer where they are writable.
+   */
   vault: Address<TAccountVault>;
   /**
-   * counterparty's offer. Constrained so the scheduled action cannot be
-   * pointed at an attacker-chosen payout.
+   * read here to build the action's account list; the action itself
+   * constrains the payout.
    */
   creator: Address<TAccountCreator>;
   counterparty: Address<TAccountCounterparty>;
@@ -451,21 +470,24 @@ export function getCommitAndSwapInstruction<
   const originalAccounts = {
     payer: { value: input.payer ?? null, isWritable: true },
     covenant: { value: input.covenant ?? null, isWritable: true },
-    vault: { value: input.vault ?? null, isWritable: true },
-    creator: { value: input.creator ?? null, isWritable: true },
-    counterparty: { value: input.counterparty ?? null, isWritable: true },
-    creatorVaultAta: { value: input.creatorVaultAta ?? null, isWritable: true },
+    vault: { value: input.vault ?? null, isWritable: false },
+    creator: { value: input.creator ?? null, isWritable: false },
+    counterparty: { value: input.counterparty ?? null, isWritable: false },
+    creatorVaultAta: {
+      value: input.creatorVaultAta ?? null,
+      isWritable: false,
+    },
     counterpartyVaultAta: {
       value: input.counterpartyVaultAta ?? null,
-      isWritable: true,
+      isWritable: false,
     },
     creatorPayoutAta: {
       value: input.creatorPayoutAta ?? null,
-      isWritable: true,
+      isWritable: false,
     },
     counterpartyPayoutAta: {
       value: input.counterpartyPayoutAta ?? null,
-      isWritable: true,
+      isWritable: false,
     },
     creatorMintAcct: {
       value: input.creatorMintAcct ?? null,
@@ -552,10 +574,18 @@ export type ParsedCommitAndSwapInstruction<
   accounts: {
     payer: TAccountMetas[0];
     covenant: TAccountMetas[1];
+    /**
+     * The escrow vault and the token accounts below are **base-layer only**.
+     * They are not delegated to the ER, so passing them as writable accounts
+     * on an ER transaction fails with `InvalidWritableAccount`. This
+     * instruction only needs their addresses — it builds the Magic Action's
+     * account list and schedules it; `swap_on_l1` is what actually touches
+     * them, and that runs on the base layer where they are writable.
+     */
     vault: TAccountMetas[2];
     /**
-     * counterparty's offer. Constrained so the scheduled action cannot be
-     * pointed at an attacker-chosen payout.
+     * read here to build the action's account list; the action itself
+     * constrains the payout.
      */
     creator: TAccountMetas[3];
     counterparty: TAccountMetas[4];

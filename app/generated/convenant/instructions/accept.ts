@@ -29,13 +29,8 @@ import {
   type WritableAccount,
   type WritableSignerAccount,
 } from "@solana/kit";
-import { findVaultPda } from "../pdas";
 import { CONVENANT_PROGRAM_ADDRESS } from "../programs";
-import {
-  expectAddress,
-  getAccountMetaFactory,
-  type ResolvedAccount,
-} from "../shared";
+import { getAccountMetaFactory, type ResolvedAccount } from "../shared";
 
 export const ACCEPT_DISCRIMINATOR = new Uint8Array([
   65, 150, 70, 216, 133, 6, 107, 4,
@@ -49,7 +44,6 @@ export type AcceptInstruction<
   TProgram extends string = typeof CONVENANT_PROGRAM_ADDRESS,
   TAccountPayer extends string | AccountMeta<string> = string,
   TAccountCovenant extends string | AccountMeta<string> = string,
-  TAccountVault extends string | AccountMeta<string> = string,
   TRemainingAccounts extends readonly AccountMeta<string>[] = [],
 > = Instruction<TProgram> &
   InstructionWithData<ReadonlyUint8Array> &
@@ -62,9 +56,6 @@ export type AcceptInstruction<
       TAccountCovenant extends string
         ? WritableAccount<TAccountCovenant>
         : TAccountCovenant,
-      TAccountVault extends string
-        ? WritableAccount<TAccountVault>
-        : TAccountVault,
       ...TRemainingAccounts,
     ]
   >;
@@ -96,102 +87,22 @@ export function getAcceptInstructionDataCodec(): FixedSizeCodec<
   );
 }
 
-export type AcceptAsyncInput<
-  TAccountPayer extends string = string,
-  TAccountCovenant extends string = string,
-  TAccountVault extends string = string,
-> = {
-  payer: TransactionSigner<TAccountPayer>;
-  covenant: Address<TAccountCovenant>;
-  /**
-   * The escrow vault, used to bound `update_offer` by the amount actually
-   * locked. Read-only here: no funds move during negotiation.
-   */
-  vault?: Address<TAccountVault>;
-};
-
-export async function getAcceptInstructionAsync<
-  TAccountPayer extends string,
-  TAccountCovenant extends string,
-  TAccountVault extends string,
-  TProgramAddress extends Address = typeof CONVENANT_PROGRAM_ADDRESS,
->(
-  input: AcceptAsyncInput<TAccountPayer, TAccountCovenant, TAccountVault>,
-  config?: { programAddress?: TProgramAddress },
-): Promise<
-  AcceptInstruction<
-    TProgramAddress,
-    TAccountPayer,
-    TAccountCovenant,
-    TAccountVault
-  >
-> {
-  // Program address.
-  const programAddress = config?.programAddress ?? CONVENANT_PROGRAM_ADDRESS;
-
-  // Original accounts.
-  const originalAccounts = {
-    payer: { value: input.payer ?? null, isWritable: true },
-    covenant: { value: input.covenant ?? null, isWritable: true },
-    vault: { value: input.vault ?? null, isWritable: true },
-  };
-  const accounts = originalAccounts as Record<
-    keyof typeof originalAccounts,
-    ResolvedAccount
-  >;
-
-  // Resolve default values.
-  if (!accounts.vault.value) {
-    accounts.vault.value = await findVaultPda({
-      covenant: expectAddress(accounts.covenant.value),
-    });
-  }
-
-  const getAccountMeta = getAccountMetaFactory(programAddress, "programId");
-  return Object.freeze({
-    accounts: [
-      getAccountMeta(accounts.payer),
-      getAccountMeta(accounts.covenant),
-      getAccountMeta(accounts.vault),
-    ],
-    data: getAcceptInstructionDataEncoder().encode({}),
-    programAddress,
-  } as AcceptInstruction<
-    TProgramAddress,
-    TAccountPayer,
-    TAccountCovenant,
-    TAccountVault
-  >);
-}
-
 export type AcceptInput<
   TAccountPayer extends string = string,
   TAccountCovenant extends string = string,
-  TAccountVault extends string = string,
 > = {
   payer: TransactionSigner<TAccountPayer>;
   covenant: Address<TAccountCovenant>;
-  /**
-   * The escrow vault, used to bound `update_offer` by the amount actually
-   * locked. Read-only here: no funds move during negotiation.
-   */
-  vault: Address<TAccountVault>;
 };
 
 export function getAcceptInstruction<
   TAccountPayer extends string,
   TAccountCovenant extends string,
-  TAccountVault extends string,
   TProgramAddress extends Address = typeof CONVENANT_PROGRAM_ADDRESS,
 >(
-  input: AcceptInput<TAccountPayer, TAccountCovenant, TAccountVault>,
+  input: AcceptInput<TAccountPayer, TAccountCovenant>,
   config?: { programAddress?: TProgramAddress },
-): AcceptInstruction<
-  TProgramAddress,
-  TAccountPayer,
-  TAccountCovenant,
-  TAccountVault
-> {
+): AcceptInstruction<TProgramAddress, TAccountPayer, TAccountCovenant> {
   // Program address.
   const programAddress = config?.programAddress ?? CONVENANT_PROGRAM_ADDRESS;
 
@@ -199,7 +110,6 @@ export function getAcceptInstruction<
   const originalAccounts = {
     payer: { value: input.payer ?? null, isWritable: true },
     covenant: { value: input.covenant ?? null, isWritable: true },
-    vault: { value: input.vault ?? null, isWritable: true },
   };
   const accounts = originalAccounts as Record<
     keyof typeof originalAccounts,
@@ -211,16 +121,10 @@ export function getAcceptInstruction<
     accounts: [
       getAccountMeta(accounts.payer),
       getAccountMeta(accounts.covenant),
-      getAccountMeta(accounts.vault),
     ],
     data: getAcceptInstructionDataEncoder().encode({}),
     programAddress,
-  } as AcceptInstruction<
-    TProgramAddress,
-    TAccountPayer,
-    TAccountCovenant,
-    TAccountVault
-  >);
+  } as AcceptInstruction<TProgramAddress, TAccountPayer, TAccountCovenant>);
 }
 
 export type ParsedAcceptInstruction<
@@ -231,11 +135,6 @@ export type ParsedAcceptInstruction<
   accounts: {
     payer: TAccountMetas[0];
     covenant: TAccountMetas[1];
-    /**
-     * The escrow vault, used to bound `update_offer` by the amount actually
-     * locked. Read-only here: no funds move during negotiation.
-     */
-    vault: TAccountMetas[2];
   };
   data: AcceptInstructionData;
 };
@@ -248,7 +147,7 @@ export function parseAcceptInstruction<
     InstructionWithAccounts<TAccountMetas> &
     InstructionWithData<ReadonlyUint8Array>,
 ): ParsedAcceptInstruction<TProgram, TAccountMetas> {
-  if (instruction.accounts.length < 3) {
+  if (instruction.accounts.length < 2) {
     // TODO: Coded error.
     throw new Error("Not enough accounts");
   }
@@ -260,11 +159,7 @@ export function parseAcceptInstruction<
   };
   return {
     programAddress: instruction.programAddress,
-    accounts: {
-      payer: getNextAccount(),
-      covenant: getNextAccount(),
-      vault: getNextAccount(),
-    },
+    accounts: { payer: getNextAccount(), covenant: getNextAccount() },
     data: getAcceptInstructionDataDecoder().decode(instruction.data),
   };
 }
