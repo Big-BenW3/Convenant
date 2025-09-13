@@ -133,19 +133,31 @@ this being a claim about privacy.
 
 ### Settlement is not yet landing on the base layer — stated plainly
 
-`commit_and_swap` executes successfully on the rollup, but the post-commit Magic
-Action does not fire on base, so the vault does not drain and the covenant stays
-`ActiveOnEr`. This is the one thing in the product that is not proven live.
+`commit_and_swap` executes successfully on the rollup, but the swap itself does
+not complete: the vault still holds 0.75 SOL and the covenant never reaches
+`SettledOnL1`. This is the one thing in the product that is not proven live.
+
+Two separate bugs were found and one was fixed:
+
+1. **The commit never undelegated** *(fixed and deployed)*. A plain
+   `commit` writes the rollup state down but leaves the covenant owned by the
+   delegation program, so `swap_on_l1` — which validates the covenant with
+   `Account<'info, Covenant>` and therefore requires program ownership — could
+   never succeed. Switching to `commit_and_undelegate` returns ownership to the
+   program; confirmed on devnet, the account owner is now the program rather
+   than `DELeGGvX...`.
+
+2. **The committed bytes are corrupt** *(open)*. After the commit the account
+   carries a valid Anchor discriminator and length but fails to decode as a
+   `Covenant` ("Enum discriminator out of range"), and the amounts at the
+   documented offsets are nonsense. So the second-stage action still has no
+   valid covenant to read. This is the remaining work.
 
 Settlement logic is verified independently: **26 LiteSVM tests** drive
 `swap_on_l1` end to end across SOL/USDC/NFT combinations and assert exact
-balance movements. What is unproven is the ER→base handoff that triggers it.
+balance movements. What is unproven is the ER→base handoff.
 
-We are flagging this rather than papering over it. The commit transaction itself
-originally failed with `MissingRequiredSignature`; that is now **fixed and
-deployed** — see §6.
-
----
+We are flagging this rather than papering over it.
 
 ## 6. The blocker we solved
 
@@ -236,9 +248,11 @@ wallet-standard · `@magicblock-labs/ephemeral-rollups-sdk` 0.17.0 · Anchor 1.1
 
 ## 10. Honest limitations
 
-- **Settlement does not complete on the base layer.** `commit_and_swap` executes
-  on the ER; the post-commit Magic Action does not fire. The logic is proven by
-  LiteSVM, the ER→base handoff is not. This is the main thing left to finish.
+- **Settlement does not complete on the base layer.** The commit executes and
+  now correctly undelegates, but the committed account data fails to decode, so
+  the swap action has nothing valid to read and the vault is untouched. The
+  logic is proven by LiteSVM; the ER→base payload is not. This is the main
+  thing left to finish.
 - **Devnet only.** The client is hard-locked to MagicBlock devnet — there is no
   mainnet option, deliberately.
 - **Demo tokens.** `scripts/mint-demo-tokens.ts` mints stand-in USDC and an NFT
