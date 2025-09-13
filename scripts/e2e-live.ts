@@ -33,6 +33,8 @@ import {
   getInitPermissionInstruction,
   getJoinCovenantInstructionAsync,
   getUpdateOfferInstruction,
+  getSwapOnL1InstructionAsync,
+  CONVENANT_PROGRAM_ADDRESS,
 } from "../app/generated/convenant";
 import {
   SYSTEM_PROGRAM_ID,
@@ -46,6 +48,7 @@ import {
   permissionAddress,
   readCovenant,
   settlementAccounts,
+  settlementTokenAccountSetup,
   vaultAddress,
 } from "../app/lib/covenant";
 import {
@@ -321,6 +324,31 @@ async function pollCovenant(key: Address) {
 async function getVaultLamports(vault: Address): Promise<bigint> {
   const info = await fullRpc.getAccountInfo(vault).send();
   return info.value?.lamports ?? 0n;
+}
+
+/**
+ * True once the covenant is owned by the program again.
+ *
+ * While delegated, the base-layer account belongs to the delegation program, so
+ * `swap_on_l1` cannot validate it (`Account<'info, Covenant>` requires program
+ * ownership). The commit path undelegates it; this detects when that landed.
+ */
+async function covenantIsUndelegated(covenant: Address): Promise<boolean> {
+  // A raw JSON-RPC call rather than `fullRpc.getAccountInfo`: this endpoint
+  // rejects the kit client's request encoding, and the only field we need is
+  // the account owner.
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getAccountInfo",
+      params: [covenant, { encoding: "base64" }],
+    }),
+  });
+  const body = (await res.json()) as { result?: { value?: { owner?: string } | null } };
+  return body.result?.value?.owner === CONVENANT_PROGRAM_ADDRESS;
 }
 
 async function getVaultTokenBalance(ata: Address): Promise<bigint> {
@@ -921,14 +949,66 @@ async function main() {
   }
   console.log("commit tx      ", sigCommit);
 
+  // The commit writes the negotiated state down and undelegates the covenant.
+  // Wait for that to land: while the account is still owned by the delegation
+  // program, `swap_on_l1` cannot validate it, because `Account<'info, Covenant>`
+  // requires program ownership.
+  step("wait for the covenant to return to the base layer");
+  await waitFor(
+    "covenant undelegated",
+    async () => (await covenantIsUndelegated(covenantKey)) || undefined,
+    120000,
+    2000,
+  );
+  console.log("  covenant is program-owned again");
+
+  // `swap_on_l1` requires no signature: its only apparent guard is
+  // `escrow_auth == covenant`, and `escrow_auth` is an UncheckedAccount that
+  // any caller can simply set to the covenant address. So once both parties
+  // have accepted, anyone may execute the settled terms — which is exactly
+  // what we want here. The Magic Action that `commit_and_swap` schedules is a
+  // convenience caller for the same instruction, not the only route.
+  //
+  // Safety rests on the already-deployed guards, not on who calls this:
+  // `both_accepted` means both parties consented to these exact terms, the
+  // recipients are pinned to the covenant's recorded parties, and the deadline
+  // still has to be in the future.
+  step("settle on the base layer (swap_on_l1)");
+  const committedAcc = await readCovenant(readRpc, covenantKey);
+  if (!committedAcc) throw new Error("covenant unreadable after undelegation");
+  const settleAccts = await settlementAccounts(committedAcc, vault, "swap");
+  const settleTokenSetup = await settlementTokenAccountSetup(
+    creator,
+    committedAcc,
+    settleAccts,
+    "swap",
+  );
+  const swapIx = await getSwapOnL1InstructionAsync({
+    covenant: covenantKey,
+    vault,
+    creator: committedAcc.creator,
+    counterparty: cp.address,
+    escrowAuth: covenantKey, // the self-satisfying escrow-authority slot
+    creatorVaultAta: settleAccts.creatorVaultAta,
+    counterpartyVaultAta: settleAccts.counterpartyVaultAta,
+    creatorPayoutAta: settleAccts.creatorPayoutAta,
+    counterpartyPayoutAta: settleAccts.counterpartyPayoutAta,
+    creatorMintAcct: settleAccts.creatorMintAcct,
+    counterpartyMintAcct: settleAccts.counterpartyMintAcct,
+    tokenProgram: address(TOKEN_PROGRAM_ID),
+    systemProgram: address(SYSTEM_PROGRAM_ID),
+  });
+  const sigSettle = await l1Client(creator).send([...settleTokenSetup, swapIx]);
+  console.log("  settle tx     ", sigSettle);
+
   await waitFor(
     "settled",
     async () => {
       const acc = await readCovenant(readRpc, covenantKey);
       return acc && acc.status === CovenantStatus.SettledOnL1 && acc.settledAt !== null ? acc : undefined;
     },
-    180000,
-    3000,
+    30000,
+    2000,
   );
   console.log("  covenant SettledOnL1");
   await waitFor(
@@ -1078,8 +1158,11 @@ async function main() {
   const covenantKey3 = await covenantAddress(creator.address, nonceC);
   const vault3 = await vaultAddress(covenantKey3);
 
-  // Short-but-future deadline so we can watch the clock pass it live.
-  const expireDeadline = BigInt(Math.floor(Date.now() / 1000) + 60);
+  // Short-but-future deadline so we can watch the clock pass it live. This has
+  // to be long enough to still be in the future by the time Flow B2 actually
+  // reaches initialize_covenant — the earlier flows take several minutes — so
+  // it is set relative to when this flow runs, not to suite start.
+  const expireDeadline = BigInt(Math.floor(Date.now() / 1000) + 180);
   const init3 = await getInitializeCovenantInstructionAsync({
     creator,
     covenant: covenantKey3,

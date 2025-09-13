@@ -215,25 +215,29 @@ export async function settlementAccounts(
   const { creator, counterparty } = partyAddresses(c);
   const creatorSol = isSol(c.creatorAsset, c.creatorMint);
   const cpSol = isSol(c.counterpartyAsset, c.counterpartyMint);
+  // On the SOL path every token-account slot is filled with the vault PDA, not
+  // a dummy: `swap_on_l1` and `expire_and_refund` declare all four `mut`, so
+  // they must resolve to a genuinely writable account. The system program is
+  // read-only and fails the mut constraint. This matches the LiteSVM tests.
   const [creatorVaultAta, counterpartyVaultAta, creatorPayoutAta, counterpartyPayoutAta] =
     await Promise.all([
-      creatorSol ? Promise.resolve(SOL_DUMMY) : ataAddress(vault, c.creatorMint),
-      cpSol ? Promise.resolve(SOL_DUMMY) : ataAddress(vault, c.counterpartyMint),
+      creatorSol ? Promise.resolve(vault) : ataAddress(vault, c.creatorMint),
+      cpSol ? Promise.resolve(vault) : ataAddress(vault, c.counterpartyMint),
       // Swap: creator receives counterparty's asset. Refund: creator gets own back.
       mode === "swap"
         ? cpSol
-          ? Promise.resolve(SOL_DUMMY)
+          ? Promise.resolve(vault)
           : ataAddress(creator, c.counterpartyMint)
         : creatorSol
-          ? Promise.resolve(SOL_DUMMY)
+          ? Promise.resolve(vault)
           : ataAddress(creator, c.creatorMint),
       // Swap: counterparty receives creator's asset. Refund: counterparty gets own back.
       mode === "swap"
         ? creatorSol
-          ? Promise.resolve(SOL_DUMMY)
+          ? Promise.resolve(vault)
           : ataAddress(counterparty, c.creatorMint)
         : cpSol
-          ? Promise.resolve(SOL_DUMMY)
+          ? Promise.resolve(vault)
           : ataAddress(counterparty, c.counterpartyMint),
     ]);
   return {

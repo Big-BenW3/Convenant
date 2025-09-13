@@ -283,9 +283,12 @@ export async function readPrivateCovenant<T>(
   if (!info?.data) return null;
   // `getBase64Encoder` turns the RPC's base64 string back into raw account
   // bytes (getBase64Decoder does the opposite direction).
-  const bytes = getBase64Encoder().encode(info.data[0]);
-  // Anchor accounts carry an 8-byte discriminator the decoder does not expect.
-  return decode(bytes.slice(8));
+  //
+  // The whole buffer is handed to `decode`: the Codama-generated account
+  // decoders are struct codecs whose first field IS the 8-byte Anchor
+  // discriminator, so stripping it here throws "enum discriminator out of
+  // range" on every private read.
+  return decode(new Uint8Array(getBase64Encoder().encode(info.data[0])));
 }
 
 export type ErClient = ReturnType<typeof createErClient>;
