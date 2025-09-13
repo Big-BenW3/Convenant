@@ -606,8 +606,18 @@ pub mod convenant {
         // runtime reject the CPI with `MissingRequiredSignature`, because the
         // covenant PDA is never a transaction signer and so arrives with
         // `is_signer == false`.
-        .commit(&[escrow_authority_info])
-        .add_post_commit_actions([action])
+        //
+        // This must be `commit_and_undelegate`, not a plain commit. A plain
+        // commit writes the rollup state back but leaves the account owned by
+        // the delegation program, so `swap_on_l1` can never validate the
+        // covenant (`Account<'info, Covenant>` requires program ownership) and
+        // the settlement silently never lands. Undelegating returns ownership
+        // to this program first.
+        //
+        // The action is therefore a *post-undelegate* action: it runs once the
+        // covenant is program-owned and writable again.
+        .commit_and_undelegate(&[escrow_authority_info])
+        .add_post_undelegate_actions([action])
         .build_and_invoke_signed(&[covenant_seeds])?;
 
         Ok(())
