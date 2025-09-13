@@ -84,6 +84,9 @@ pub mod convenant {
         covenant.vault_bump = ctx.bumps.vault;
         covenant.created_at = clock.unix_timestamp;
         covenant.settled_at = None;
+        // Provisional: only the creator's lock is in the vault until the
+        // counterparty joins, at which point this becomes the real total.
+        covenant.escrow_total = creator_amount;
         covenant.terms_hash = covenant.hash_terms();
 
         // Lock creator's asset into the (base-layer) vault.
@@ -163,6 +166,11 @@ pub mod convenant {
         covenant.counterparty_asset = counterparty_asset;
         covenant.counterparty_mint = counterparty_mint;
         covenant.counterparty_joined = true;
+        // Both parties' locks are now in the vault. Recorded so the ER-side
+        // negotiation can bound a re-price without reading the vault.
+        covenant.escrow_total = covenant
+            .creator_amount
+            .saturating_add(counterparty_amount);
         covenant.terms_hash = covenant.hash_terms();
 
         if is_sol(&counterparty_asset, &counterparty_mint) {
@@ -400,7 +408,7 @@ pub mod convenant {
     // Private negotiation (ephemeral rollup)
     // -----------------------------------------------------------------
 
-    /// A party updates their committed SOL offer during negotiation.
+    /// A party updates their committed offer during negotiation.
     pub fn update_offer(ctx: Context<Negotiate>, new_amount: u64) -> Result<()> {
         let covenant = &mut ctx.accounts.covenant;
         require!(
@@ -413,59 +421,38 @@ pub mod convenant {
         );
         require!(new_amount > 0, ConvenantError::ZeroAmount);
 
-        // A party may only re-price its own offer, and only down to what the
-        // vault actually holds. Without this bound a party could negotiate an
-        // amount its escrow cannot cover, and settlement would later fail — or
-        // silently consume the counterparty's side of the vault.
-        //
-        // The bound is per-asset: for SOL the vault lamports are the whole
-        // story. Token/NFT offers are covered by their vault token accounts,
-        // which this instruction does not carry, so those are bounded by the
-        // counterparty's committed amount instead (never above what was locked).
-        let (asset, mint, own_locked, other_locked) = if ctx.accounts.payer.key() == covenant.creator
-        {
-            (
-                covenant.creator_asset,
-                covenant.creator_mint,
-                covenant.creator_amount,
-                covenant.counterparty_amount,
-            )
+        // A party may only re-price its own offer, and only before accepting.
+        let is_creator = ctx.accounts.payer.key() == covenant.creator;
+        if is_creator {
+            require!(!covenant.creator_accepted, ConvenantError::FrozenAfterAccept);
         } else if Some(ctx.accounts.payer.key()) == covenant.counterparty {
-            (
-                covenant.counterparty_asset,
-                covenant.counterparty_mint,
-                covenant.counterparty_amount,
-                covenant.creator_amount,
-            )
+            require!(
+                !covenant.counterparty_accepted,
+                ConvenantError::FrozenAfterAccept
+            );
         } else {
             return err!(ConvenantError::UnauthorizedSigner);
-        };
+        }
 
-        // Never allow a re-price to claim more than the other side's escrow,
-        // which would make settlement insolvent for no legitimate reason.
+        // Solvency bound. Negotiation runs on the ER, where the vault PDA is
+        // not delegated and therefore cannot be read, so the bound comes from
+        // `escrow_total` — the sum both parties actually locked. The two offers
+        // together must stay within it, otherwise `swap_on_l1` would try to
+        // release more than the vault holds and settlement would break.
+        let combined = if is_creator {
+            new_amount.saturating_add(covenant.counterparty_amount)
+        } else {
+            covenant.creator_amount.saturating_add(new_amount)
+        };
         require!(
-            new_amount <= other_locked,
+            combined <= covenant.escrow_total,
             ConvenantError::InsufficientFunds
         );
 
-        if is_sol(&asset, &mint) {
-            require!(
-                new_amount <= ctx.accounts.vault.lamports(),
-                ConvenantError::InsufficientFunds
-            );
-        } else {
-            // Token offers cannot exceed what this party locked at join time.
-            require!(
-                new_amount <= own_locked,
-                ConvenantError::InsufficientFunds
-            );
-        }
-
-        if ctx.accounts.payer.key() == covenant.creator {
-            require!(!covenant.creator_accepted, ConvenantError::FrozenAfterAccept);
+        // Validate-then-write: nothing is mutated until every check has passed.
+        if is_creator {
             covenant.creator_amount = new_amount;
         } else {
-            require!(!covenant.counterparty_accepted, ConvenantError::FrozenAfterAccept);
             covenant.counterparty_amount = new_amount;
         }
 
@@ -568,19 +555,27 @@ pub mod convenant {
                 is_writable: false,
             },
         ];
+        // The magic program requires the action's `escrow_authority` — the
+        // covenant PDA — to authorize the scheduled bundle. PDA signing via
+        // `invoke_signed` only takes effect for accounts whose CPI meta has
+        // `is_signer = true`, and the SDK derives that straight from
+        // `AccountInfo::is_signer`. A PDA that is not itself a transaction
+        // signer carries `is_signer == false`, so the signature would be
+        // silently dropped and the runtime rejects the CPI with
+        // `MissingRequiredSignature`. Promote a copy of the account info; the
+        // genuine authority comes from the seeds handed to `invoke_signed`.
+        let mut escrow_authority_info = ctx.accounts.covenant.to_account_info();
+        escrow_authority_info.is_signer = true;
+
         let action = CallHandler {
             destination_program: crate::ID,
             accounts: action_accounts,
             args: action_args,
-            // Signer that pays the action fees from an escrow PDA derived from
-            // the delegated covenant PDA (verified in swap_on_l1).
-            escrow_authority: ctx.accounts.covenant.to_account_info(),
+            // Signer that authorizes the action and pays its fees; verified in
+            // swap_on_l1.
+            escrow_authority: escrow_authority_info.clone(),
             compute_units: 200_000,
         };
-        // The magic program requires the action's escrow_authority (the
-        // covenant PDA) to sign the ScheduleIntentBundle CPI. Without PDA
-        // seeds the CPI fails `MissingRequiredSignature` on the ER — this is
-        // the runtime commit blocker.
         let covenant_seeds: &[&[u8]] = &[
             COVENANT_SEED,
             ctx.accounts.covenant.creator.as_ref(),
@@ -592,7 +587,12 @@ pub mod convenant {
             ctx.accounts.magic_context.to_account_info(),
             ctx.accounts.magic_program.to_account_info(),
         )
-        .commit(&[ctx.accounts.covenant.to_account_info()])
+        // Both the commit list and the action's escrow authority need the
+        // promoted copy. Passing the unmodified AccountInfo here makes the
+        // runtime reject the CPI with `MissingRequiredSignature`, because the
+        // covenant PDA is never a transaction signer and so arrives with
+        // `is_signer == false`.
+        .commit(&[escrow_authority_info])
         .add_post_commit_actions([action])
         .build_and_invoke_signed(&[covenant_seeds])?;
 
@@ -944,10 +944,6 @@ pub struct Negotiate<'info> {
         bump
     )]
     pub covenant: Account<'info, Covenant>,
-    /// The escrow vault, used to bound `update_offer` by the amount actually
-    /// locked. Read-only here: no funds move during negotiation.
-    #[account(mut, seeds = [VAULT_SEED, covenant.key().as_ref()], bump)]
-    pub vault: SystemAccount<'info>,
 }
 
 #[commit]
@@ -961,31 +957,36 @@ pub struct CommitAndSwap<'info> {
         bump
     )]
     pub covenant: Account<'info, Covenant>,
-    #[account(mut, seeds = [VAULT_SEED, covenant.key().as_ref()], bump)]
+    /// The escrow vault and the token accounts below are **base-layer only**.
+    /// They are not delegated to the ER, so passing them as writable accounts
+    /// on an ER transaction fails with `InvalidWritableAccount`. This
+    /// instruction only needs their addresses — it builds the Magic Action's
+    /// account list and schedules it; `swap_on_l1` is what actually touches
+    /// them, and that runs on the base layer where they are writable.
+    #[account(seeds = [VAULT_SEED, covenant.key().as_ref()], bump)]
     pub vault: SystemAccount<'info>,
-    /// CHECK: validated in-handler — must equal `covenant.creator`; receives the
-    /// counterparty's offer. Constrained so the scheduled action cannot be
-    /// pointed at an attacker-chosen payout.
-    #[account(mut, address = covenant.creator @ ConvenantError::CreatorMismatch)]
+    /// CHECK: validated in-context — must equal `covenant.creator`. Address is
+    /// read here to build the action's account list; the action itself
+    /// constrains the payout.
+    #[account(address = covenant.creator @ ConvenantError::CreatorMismatch)]
     pub creator: UncheckedAccount<'info>,
     /// CHECK: validated in-context — must equal the joined counterparty.
     #[account(
-        mut,
         address = covenant.counterparty.ok_or(ConvenantError::CounterpartyNotJoined)?
             @ ConvenantError::CounterpartyMismatch
     )]
     pub counterparty: UncheckedAccount<'info>,
     /// CHECK: vault ATA holding the creator's SPL offer (SOL: unused)
-    #[account(mut)]
+    #[account()]
     pub creator_vault_ata: UncheckedAccount<'info>,
     /// CHECK: vault ATA holding the counterparty's SPL offer (SOL: unused)
-    #[account(mut)]
+    #[account()]
     pub counterparty_vault_ata: UncheckedAccount<'info>,
     /// CHECK: counterparty's payout ATA for the creator's SPL offer (SOL: unused)
-    #[account(mut)]
+    #[account()]
     pub creator_payout_ata: UncheckedAccount<'info>,
     /// CHECK: creator's payout ATA for the counterparty's SPL offer (SOL: unused)
-    #[account(mut)]
+    #[account()]
     pub counterparty_payout_ata: UncheckedAccount<'info>,
     /// CHECK: mint account for the creator's SPL offer (decimals); SOL: dummy
     #[account()]
