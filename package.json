@@ -1,14 +1,14 @@
 {
-  "name": "nextjs-anchor",
-  "description": "Next.js, Tailwind, @solana/kit, Anchor vault program",
+  "name": "convenant",
+  "description": "Private two-party swaps on MagicBlock Ephemeral Rollups",
   "keywords": [
+    "solana",
+    "magicblock",
+    "ephemeral-rollups",
     "anchor",
-    "kit",
     "nextjs",
-    "react",
-    "solana-kit",
-    "tailwind",
-    "typescript"
+    "tee",
+    "escrow"
   ],
   "create-solana-dapp": {
     "rename": {
@@ -33,7 +33,10 @@
     "format:check": "prettier --check .",
     "lint": "eslint",
     "setup": "npm run anchor-build && npm run codama:js",
-    "start": "next start"
+    "start": "next start",
+    "verify-hardening": "tsx scripts/verify-hardening.ts",
+    "e2e": "tsx scripts/e2e-live.ts",
+    "deploy:devnet": "bash scripts/deploy-devnet.sh"
   },
   "dependencies": {
     "@magicblock-labs/ephemeral-rollups-sdk": "0.17.0",

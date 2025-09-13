@@ -1,6 +1,60 @@
-# nextjs-anchor
+# Convenant
 
-Next.js starter with Tailwind CSS, `@solana/kit`, and an Anchor vault program example.
+**Private two-party swaps on MagicBlock Ephemeral Rollups.**
+
+Two parties escrow SOL, SPL tokens, or NFTs into a program-owned vault,
+negotiate inside a TEE-backed ephemeral rollup where the terms are readable
+only by the two of them, and settle atomically back on Solana.
+
+- **Contract:** `2uY6gVNHe62XZXByt796pbwye1p7eTu2Nftv7uwC5CtQ` (devnet)
+- **Submission:** see [`SUBMISSION.md`](./SUBMISSION.md)
+
+> Settlement is proven by the LiteSVM suite but the ER→base handoff does not yet
+> complete live. See "Honest limitations" in [`SUBMISSION.md`](./SUBMISSION.md).
+
+## Quick start
+
+```shell
+npm install
+npm run setup   # anchor build + generate the TypeScript client from the IDL
+npm run dev     # http://localhost:3000
+```
+
+## Scripts
+
+| Command | What it does |
+| --- | --- |
+| `npm run setup` | Build the Anchor program and regenerate the Codama client |
+| `npm run dev` | Start the Next.js dev server |
+| `npm run build` | Production build |
+| `npm run anchor-test` | 26 LiteSVM tests (16 of them negative security tests) |
+| `npm run lint` / `npm run format` | ESLint / Prettier |
+| `bash scripts/deploy-devnet.sh` | Redeploy the program (idempotent) |
+| `npx tsx scripts/e2e-live.ts` | Live two-wallet run against the MagicBlock TEE |
+| `npx tsx scripts/verify-hardening.ts` | Attempts the settlement theft against the deployed program |
+
+## Layout
+
+```
+app/            Next.js App Router (landing, create, dashboard, covenant detail)
+  generated/    Codama-generated client — do not edit
+  lib/          covenant domain helpers, MagicBlock adapter, wallet-standard
+anchor/         Anchor workspace
+  programs/convenant/   the program (state, token helpers, errors, tests)
+scripts/        live e2e, devnet deploy, hardening check, demo token minting
+```
+
+## Verifying the security fixes
+
+```shell
+npx tsx scripts/verify-hardening.ts
+```
+
+Creates a real covenant on devnet, then has the counterparty attempt the
+original theft — a refund naming a third-party wallet as the creator. The
+deployed program must reject it (`CreatorMismatch`, 6023) with the escrow intact.
+
+---
 
 ## Getting Started
 
