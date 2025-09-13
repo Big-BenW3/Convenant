@@ -76,6 +76,18 @@ pub struct Covenant {
 
     pub created_at: i64,
     pub settled_at: Option<i64>,
+
+    /// Total value actually locked in the vault, set once both parties have
+    /// joined.
+    ///
+    /// Negotiation runs on the ephemeral rollup, where the vault PDA is *not*
+    /// delegated and therefore not readable — a party cannot check what the
+    /// escrow holds from there. Recording the total here makes the solvency
+    /// bound available in the same state the negotiation reads, so
+    /// `update_offer` can reject a re-price the vault could never cover.
+    ///
+    /// Appended last so the field offsets used by the LiteSVM tests stay stable.
+    pub escrow_total: u64,
 }
 
 impl Covenant {
