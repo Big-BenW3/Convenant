@@ -149,6 +149,41 @@ async function withRetry<T>(desc: string, fn: () => Promise<T>, tries = 5): Prom
  * Sends instructions raw over HTTP and confirms by polling getSignatureStatuses.
  * Avoids createClient's WebSocket-based confirmation (unsupported on MagicBlock).
  */
+/** Lamports in one SOL, for readable balance math below. */
+const LAMPORTS_PER_SOL = 1_000_000_000n;
+
+/**
+ * Move SOL from a keypair file to `recipient`, used to top the e2e wallets up
+ * between runs. MagicBlock devnet's requestAirdrop is a no-op, so funding has
+ * to come from an already-funded account.
+ */
+async function transferSol(
+  fromKeypairPath: string,
+  recipient: Address,
+  lamports: bigint,
+): Promise<void> {
+  const secret = JSON.parse(readFileSync(fromKeypairPath, "utf8"));
+  const from = await createKeyPairSignerFromBytes(new Uint8Array(secret));
+
+  // SystemProgram.transfer, built by hand: @solana/kit 6 no longer exports a
+  // helper for it, and the layout is trivial — u32 instruction index (2)
+  // followed by the u64 amount.
+  const data = new Uint8Array(12);
+  new DataView(data.buffer).setUint32(0, 2, true);
+  new DataView(data.buffer).setBigUint64(4, lamports, true);
+
+  const ix: Instruction = {
+    programAddress: address("11111111111111111111111111111111"),
+    accounts: [
+      { address: from.address, role: 3 }, // writable signer
+      { address: recipient, role: 1 }, // writable
+    ],
+    data,
+  } as unknown as Instruction;
+
+  await sendIxsRaw(from, [ix], url, { skipPreflight: false });
+}
+
 async function sendIxsRaw(
   payer: TransactionSigner,
   ixs: readonly Instruction[],
@@ -502,12 +537,38 @@ async function main() {
 
   console.log("creator        ", creator.address);
   console.log("counterparty   ", cp.address);
+
+  const step = (m: string) => console.log(`  [step] ${m}`);
+
+  // Each run escrows several SOL across four flows, so a wallet that has run
+  // the suite before is usually short. `requestAirdrop` on MagicBlock devnet is
+  // a no-op that only charges a fee (the returned signature confirms but no
+  // lamports move), so the wallets are topped up from a funding key instead.
+  // Set E2E_FUNDER_KEYPAIR to enable; skipped when it is absent.
+  const MIN_BALANCE = 3n * LAMPORTS_PER_SOL;
+  const funderPath = process.env.E2E_FUNDER_KEYPAIR;
+  if (funderPath) {
+    for (const [label, signer] of [["creator", creator], ["counterparty", cp]] as const) {
+      let bal = await getBalance(signer.address);
+      if (bal >= MIN_BALANCE) continue;
+      const top = MIN_BALANCE - bal + LAMPORTS_PER_SOL / 2n;
+      step(`top up ${label} (+${fmtLamports(top)})`);
+      await transferSol(funderPath, signer.address, top);
+      bal = await getBalance(signer.address);
+      console.log(`  ${label} bal now ${fmtLamports(bal)}`);
+    }
+  } else if ((await getBalance(creator.address)) < MIN_BALANCE) {
+    console.log(
+      "\nWARNING: the creator wallet is short. Set E2E_FUNDER_KEYPAIR to a\n" +
+      "         funded devnet keypair and the suite will top itself up.\n" +
+      "         (requestAirdrop does not work on MagicBlock devnet.)",
+    );
+  }
+
   console.log("creator  bal   ", fmtLamports(await getBalance(creator.address)));
   console.log("counterparty bal", fmtLamports(await getBalance(cp.address)));
   const cpStart = await getBalance(cp.address);
   const creatorFundsStart = await getBalance(creator.address);
-
-  const step = (m: string) => console.log(`  [step] ${m}`);
 
   // =================================================================
   // FLOW A: create -> join -> TEE delegate -> init_permission -> private
@@ -742,32 +803,71 @@ async function main() {
   );
   console.log("  unauthenticated read correctly denied");
 
-  // 7. NEGOTIATE ON THE ER: counterparty raises to 0.3, both accept
+  // 7. NEGOTIATE ON THE ER.
+  //
+  // The vault holds escrow_total = 0.50 + 0.25 = 0.75 SOL, and settlement pays
+  // out BOTH committed offers from it. The two offers must therefore sum to at
+  // most the escrow: the creator lowers to 0.40 and the counterparty raises to
+  // 0.30, for a total of 0.70. Pushing the counterparty to 0.30 while the
+  // creator still offered 0.50 would ask the vault for 0.80 SOL it does not
+  // hold, which the program now rejects as InsufficientFunds.
+  const creatorAmount1 = 400_000_000n;
   const cpAmount1 = 300_000_000n;
+
+  const updOffCreator = getUpdateOfferInstruction({
+    payer: creator,
+    covenant: covenantKey,
+    newAmount: creatorAmount1,
+  });
+  const sigUpdateCreator = await erClient(creator, erRpcEndpoint).sendTransaction([updOffCreator]);
+  console.log("update_offer (creator -> 0.40) tx", sigUpdateCreator);
+
   const updOff = getUpdateOfferInstruction({
     payer: cp,
     covenant: covenantKey,
-    vault: vault,
     newAmount: cpAmount1,
   });
   const sigUpdate = await erClient(cp, erRpcEndpoint).sendTransaction([updOff]);
-  console.log("update_offer tx", sigUpdate);
+  console.log("update_offer (counterparty -> 0.30) tx", sigUpdate);
+
+  // Prove the solvency bound actually bites.
+  const escrowTotal = 500_000_000n + 250_000_000n;
+  const overEscrow = escrowTotal + 1n;
+  try {
+    const badIx = getUpdateOfferInstruction({
+      payer: cp,
+      covenant: covenantKey,
+      newAmount: overEscrow,
+    });
+    await erClient(cp, erRpcEndpoint).sendTransaction([badIx]);
+    console.log("  NOTE: over-escrow re-price was NOT rejected (unexpected)");
+  } catch (e) {
+    assert(
+      String(e).includes("6010") || String(e).includes("InsufficientFunds"),
+      "an offer exceeding the escrow must be rejected",
+    );
+    console.log("  over-escrow re-price correctly rejected (InsufficientFunds)");
+  }
+
   const erRpcCp = `${erEndpoint}?token=${encodeURIComponent(auth.token)}`;
   await waitFor(
     "counterparty amount updated on ER",
     async () => {
       const acc = await readCovenantEr(erRpcCp, auth.token, covenantKey);
-      return acc && acc.counterpartyAmount === cpAmount1 && acc.status === CovenantStatus.ActiveOnEr
+      return acc &&
+        acc.creatorAmount === creatorAmount1 &&
+        acc.counterpartyAmount === cpAmount1 &&
+        acc.status === CovenantStatus.ActiveOnEr
         ? acc
         : undefined;
     },
     30000,
     2000,
   );
-  console.log("  offer updated to 0.3 SOL");
+  console.log("  negotiated: creator 0.40 SOL, counterparty 0.30 SOL");
 
-  await erClient(creator, erRpcEndpoint).sendTransaction([getAcceptInstruction({ payer: creator, covenant: covenantKey, vault })]);
-  const sigAcceptCp = await erClient(cp, erRpcEndpoint).sendTransaction([getAcceptInstruction({ payer: cp, covenant: covenantKey, vault })]);
+  await erClient(creator, erRpcEndpoint).sendTransaction([getAcceptInstruction({ payer: creator, covenant: covenantKey })]);
+  const sigAcceptCp = await erClient(cp, erRpcEndpoint).sendTransaction([getAcceptInstruction({ payer: cp, covenant: covenantKey })]);
   console.log("  both accepted (cp accept", sigAcceptCp + ")");
   await waitFor(
     "both_accepted + ActiveOnEr",
@@ -1203,9 +1303,9 @@ async function main() {
   console.log("  private read ok:", assetState(privCC));
 
   // 7. ACCEPT (no negotiation — fixed terms).
-  await erClient(creator, erRpcEndpoint).sendTransaction([getAcceptInstruction({ payer: creator, covenant: covenantKey4, vault: vault4 })]);
+  await erClient(creator, erRpcEndpoint).sendTransaction([getAcceptInstruction({ payer: creator, covenant: covenantKey4 })]);
   const erCpC = erClient(cp, erRpcEndpoint);
-  await erCpC.sendTransaction([getAcceptInstruction({ payer: cp, covenant: covenantKey4, vault: vault4 })]);
+  await erCpC.sendTransaction([getAcceptInstruction({ payer: cp, covenant: covenantKey4 })]);
   console.log("  both accepted");
   await waitFor(
     "FLOW C both_accepted",
