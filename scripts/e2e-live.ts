@@ -1162,7 +1162,10 @@ async function main() {
   // to be long enough to still be in the future by the time Flow B2 actually
   // reaches initialize_covenant — the earlier flows take several minutes — so
   // it is set relative to when this flow runs, not to suite start.
-  const expireDeadline = BigInt(Math.floor(Date.now() / 1000) + 180);
+  // Long enough to still be in the future when this flow reaches
+  // initialize_covenant, short enough that the suite does not drag.
+  const EXPIRE_DEADLINE_SECS = 90;
+  const expireDeadline = BigInt(Math.floor(Date.now() / 1000) + EXPIRE_DEADLINE_SECS);
   const init3 = await getInitializeCovenantInstructionAsync({
     creator,
     covenant: covenantKey3,
@@ -1210,11 +1213,12 @@ async function main() {
   await l1Client(creator).send([delegate3]);
   console.log("  delegated covenant3 to ", route3.fqdn);
 
-  // Wait for the deadline to actually pass (60s), then expire on the base.
+  // Wait for the deadline to actually pass, then expire on the base. The
+  // budget is derived from the deadline so the two cannot drift apart.
   await waitFor(
     "clock past deadline",
     async () => (BigInt(Math.floor(Date.now() / 1000)) >= expireDeadline ? true : undefined),
-    120000,
+    Number(EXPIRE_DEADLINE_SECS) * 2000 + 30000,
     2000,
   );
   console.log("  deadline passed, expiring…");
